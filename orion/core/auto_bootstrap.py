@@ -161,6 +161,32 @@ class BootstrapSolver:
         input_level = self.finally_solve_full_level_dag()
 
         self.assign_levels_to_layers()
+        
+        # DEBUG: Print shortest path and node→level assignments
+        # This output helps understand the LevelDAG optimization decisions:
+        # - Shortest path shows critical path through network (determines input level)
+        # - Node→level mapping shows output level assigned to each module
+        # - For residual blocks: shortcut modules may have lower output levels,
+        #   but the critical requirement is that both paths align at addition points
+        print("\n" + "="*80)
+        print("DEBUG: LevelDAG Shortest Path and Level Assignments")
+        print("="*80)
+        print(f"Total nodes in shortest path: {len(self.shortest_path)}")
+        print("\nShortest path nodes (sorted by level):")
+        sorted_path = sorted(self.shortest_path, key=lambda x: int(x.split("=")[-1]), reverse=True)
+        for node in sorted_path:
+            print(f"  {node}")
+        
+        print("\nNetwork DAG node→level mapping:")
+        for node in self.network_dag.nodes:
+            node_data = self.network_dag.nodes[node]
+            level = node_data.get("level", "N/A")
+            module = node_data.get("module")
+            depth = getattr(module, "depth", "N/A") if module else "N/A"
+            level_str = str(level) if level != "N/A" else "N/A"
+            print(f"  {node:30s} → level={level_str:>3s}, depth={depth}")
+        print("="*80 + "\n")
+        
         num_bootstraps, bootstrapper_slots = self.mark_bootstrap_locations()
 
         return input_level, num_bootstraps, bootstrapper_slots

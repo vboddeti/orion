@@ -285,7 +285,8 @@ class Scheme:
             module = node_attrs["module"]
             if isinstance(module, Module):
                 print(f"├── {node} @ level={module.level}", flush=True)
-                module.compile()
+                if hasattr(module, 'compile') and callable(module.compile):
+                    module.compile()
                 
         return input_level # level at which to encrypt the input.
 
