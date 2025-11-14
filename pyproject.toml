@@ -21,6 +21,9 @@ dependencies = [
     "matplotlib>=3.1.0",
     "h5py>=3.5.0",
     "certifi>=2024.2.2",
+    "pytest>=8.4.2",
+    "rich>=14.2.0",
+    "opt-einsum>=3.4.0",
 ]
 
 [tool.poetry]

@@ -39,9 +39,11 @@ func AddRotationKey(rotation C.int) {
 		rotKey := scheme.KeyGen.GenGaloisKeyNew(galEl, scheme.SecretKey)
 		liveRotKeys[galEl] = rotKey
 
+		// CRITICAL: Update both scheme.EvalKeys and scheme.Evaluator
+		// scheme.EvalKeys is used by EvaluateLinearTransform to create new evaluators
 		allKeysList := GetValuesFromMap(liveRotKeys)
-		keys := rlwe.NewMemEvaluationKeySet(scheme.RelinKey, allKeysList...)
-		scheme.Evaluator = scheme.Evaluator.WithKey(keys)
+		scheme.EvalKeys = rlwe.NewMemEvaluationKeySet(scheme.RelinKey, allKeysList...)
+		scheme.Evaluator = scheme.Evaluator.WithKey(scheme.EvalKeys)
 	}
 }
 

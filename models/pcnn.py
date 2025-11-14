@@ -404,41 +404,28 @@ class HerPNConv(on.Module):
 
 class HerPNPool(on.Module):
     """
-    HerPN activation followed by average pooling.
-    Note: Since Orion doesn't support adaptive pooling in tracing,
-    we use a fixed kernel size that must match the actual input size.
+    HerPN activation followed by adaptive average pooling.
+
+    Uses AdaptiveAvgPool2d for proper FHE support:
+    - Automatically computes kernel size from input/output dimensions
+    - Correctly handles FHE gaps and shapes during compilation
+    - Works with any input/output size combination
     """
 
     def __init__(self, planes, output_size, input_size=None):
         super(HerPNPool, self).__init__()
         self.planes = planes
         self.output_size = output_size
-        self.input_size = input_size  # Expected input spatial size
+        self.input_size = input_size  # Kept for backward compatibility (not used)
 
         # BatchNorms for HerPN (will be fused)
         self.bn0 = on.BatchNorm2d(planes)
         self.bn1 = on.BatchNorm2d(planes)
         self.bn2 = on.BatchNorm2d(planes)
 
-        # Pooling layer - initialize if input_size is known
-        if input_size is not None:
-            # Calculate kernel size needed to go from input_size to output_size
-            if isinstance(output_size, int):
-                output_h = output_w = output_size
-            else:
-                output_h, output_w = output_size
-
-            if isinstance(input_size, int):
-                input_h = input_w = input_size
-            else:
-                input_h, input_w = input_size
-
-            kernel_h = input_h // output_h
-            kernel_w = input_w // output_w
-
-            self.pool = on.AvgPool2d((kernel_h, kernel_w))
-        else:
-            self.pool = None
+        # Use AdaptiveAvgPool2d for proper FHE support
+        # This handles kernel size computation internally and correctly manages FHE gaps
+        self.pool = on.AdaptiveAvgPool2d(output_size)
 
         # HerPN activation (compiled from BatchNorms)
         self.herpn = None
@@ -482,12 +469,8 @@ class HerPNPool(on.Module):
             if self.herpn is not None:
                 # Use fused HerPN (avoids branching in network DAG)
                 out = self.herpn(x)
-                # Use pooling
-                if self.pool is not None:
-                    out = self.pool(out)
-                else:
-                    # Fallback: use adaptive if pool not initialized
-                    out = torch.nn.functional.adaptive_avg_pool2d(out, self.output_size)
+                # Apply adaptive pooling
+                out = self.pool(out)
                 return out
             else:
                 # During training, use unfused BatchNorms
@@ -500,12 +483,8 @@ class HerPNPool(on.Module):
                     + torch.divide(x2, math.sqrt(4 * math.pi))
                 )
 
-                # Use pooling
-                if self.pool is not None:
-                    out = self.pool(out)
-                else:
-                    # Fallback: use adaptive if pool not initialized
-                    out = torch.nn.functional.adaptive_avg_pool2d(out, self.output_size)
+                # Apply adaptive pooling
+                out = self.pool(out)
                 return out
         else:
             # FHE mode
