@@ -302,7 +302,9 @@ class NewEvaluator:
                 self.backend.LoadRotationKey(serial_key, int(key))
 
     def remove_rotation_keys(self):
-        self.backend.RemoveRotationKeys() 
+        self.backend.RemoveRotationKeys()
 
     def remove_plaintext_diagonals(self, transform_id):
         self.backend.RemovePlaintextDiagonals(transform_id)
+
+

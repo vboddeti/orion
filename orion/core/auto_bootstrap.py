@@ -216,33 +216,47 @@ class BootstrapSolver:
 
         # We'll use this empty level DAG to query the number of
         # bootstraps per layer of the network dag.
-        query = LevelDAG(self.l_eff, self.network_dag, path=None)  
-        
+        query = LevelDAG(self.l_eff, self.network_dag, path=None)
+
         total_bootstraps = 0
         bootstrapper_slots = []
+        bootstrap_locations = []  # Track where bootstraps are placed
 
         for node in self.network_dag.nodes:
             node_w_level = node_map[node]
-            
+
             children = self.network_dag.successors(node)
             self.network_dag.nodes[node]["bootstrap"] = False
-            
+
             # Iterate over the layer's children to determine if their assigned
             # levels necessitate a bootstrap of the current layer.
             for child in children:
                 child_w_level = node_map[child]
                 _, curr_boots = query.estimate_bootstrap_latency(
                     node_w_level, child_w_level)
-                
+
                 total_bootstraps += curr_boots
                 if curr_boots > 0:
                     self.network_dag.nodes[node]["bootstrap"] = True
                     slots = self.get_bootstrap_slots(node)
-                    
+
+                    # Track bootstrap location for logging
+                    node_level = int(node_w_level.split("=")[-1])
+                    bootstrap_locations.append((node, node_level))
+
                     # Add bootstrapper to generate
                     if slots not in bootstrapper_slots:
                         bootstrapper_slots.append(slots)
                     break
+
+        # Log bootstrap placement locations
+        if bootstrap_locations:
+            print("\n" + "="*80)
+            print("BOOTSTRAP PLACEMENT:")
+            print("="*80)
+            for node_name, level in sorted(bootstrap_locations, key=lambda x: -x[1]):
+                print(f"  • {node_name:40s} @ level={level}")
+            print("="*80 + "\n")
 
         return total_bootstraps , bootstrapper_slots
     

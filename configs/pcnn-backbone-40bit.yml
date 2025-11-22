@@ -1,0 +1,34 @@
+comment: "PCNN Backbone - 40-bit moduli (ResNet-style)"
+
+ckks_params:
+  LogN: 16
+
+  # ResNet-style configuration: 40-bit computation moduli
+  # Trade: Lower precision for faster computation
+  #
+  # PCNN Backbone depth: ~34 levels
+  # With 16 levels per section: need 2-3 bootstraps
+  LogQ: [55, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40]
+
+  # Higher auxiliary primes to compensate for lower compute moduli
+  LogP: [61, 61, 61]
+
+  LogScale: 40  # Smaller scale (faster, less precision)
+  H: 192
+  RingType: standard
+
+boot_params:
+  LogP: [61, 61, 61, 61, 61, 61, 61, 61, 61, 61, 61, 61, 61, 61]
+
+orion:
+  margin: 2
+  bootstrap_placement_margin: 2
+  embedding_method: hybrid
+  backend: lattigo
+
+  fuse_modules: true
+  debug: true
+
+  diags_path: ../data/diagonals.h5
+  keys_path: ../data/keys.h5
+  io_mode: none

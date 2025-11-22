@@ -270,3 +270,36 @@ class CipherTensor:
         
     def decrypt(self):
         return self.encryptor.decrypt(self)
+
+    def serialize(self):
+        """Serialize all ciphertexts to bytes for multiprocessing."""
+        serialized_data = []
+        for ctxt_id in self.ids:
+            result = self.backend.SerializeCiphertext(ctxt_id)
+            # SerializeCiphertext returns (numpy_array, pointer_to_free)
+            # We only need the numpy array
+            if isinstance(result, tuple):
+                data = result[0]
+            else:
+                data = result
+            serialized_data.append(data)
+        return {
+            'data': serialized_data,
+            'shape': self.shape,
+            'on_shape': self.on_shape
+        }
+
+    @classmethod
+    def deserialize(cls, scheme, serialized):
+        """Deserialize bytes back to CipherTensor."""
+        import numpy as np
+        ctxt_ids = []
+        for data in serialized['data']:
+            # Ensure data is numpy array with uint8 dtype
+            if not isinstance(data, np.ndarray):
+                data = np.frombuffer(data, dtype=np.uint8)
+            elif data.dtype != np.uint8:
+                data = data.astype(np.uint8)
+            ctxt_id = scheme.backend.DeserializeCiphertext(data)
+            ctxt_ids.append(ctxt_id)
+        return cls(scheme, ctxt_ids, serialized['shape'], serialized['on_shape'])

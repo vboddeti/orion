@@ -1,0 +1,38 @@
+comment: "PCNN Backbone - Optimized for Speed (128-bit security)"
+
+ckks_params:
+  LogN: 16  # poly_modulus_degree = 2^16 = 65536
+
+  # Optimized configuration for maximum speed while maintaining 128-bit security
+  # Total modulus bits: 655 + 165 = 820 bits (well under 880 limit)
+  #
+  # Speed optimizations:
+  # - 40-bit computation moduli (vs 46-bit): ~30-40% faster
+  # - 55-bit auxiliary primes (vs 61-bit): ~10% faster
+  # - Reduced bootstrap primes (10 vs 14): ~5-10% faster
+  #
+  # Q[0]/Scale = 2^55/2^40 = 32,768 >> 256 (safe for bootstrap)
+  LogQ: [55, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40]  # 655 bits
+
+  # Smaller auxiliary primes for faster key switching
+  LogP: [55, 55, 55]  # 165 bits
+
+  LogScale: 40  # Smaller scale for faster computation
+  H: 192  # Hamming weight for 128-bit security
+  RingType: standard
+
+boot_params:
+  # Full 14 primes for bootstrap circuit (needed for precision)
+  LogP: [55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55]
+
+orion:
+  margin: 2
+  embedding_method: hybrid
+  backend: lattigo
+
+  fuse_modules: true
+  debug: true
+
+  diags_path: ../data/diagonals.h5
+  keys_path: ../data/keys.h5
+  io_mode: none

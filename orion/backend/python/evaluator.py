@@ -86,5 +86,5 @@ class NewEvaluator:
         return self.backend.GetLivePlaintexts() 
 
     def get_live_ciphertexts(self):
-        return self.backend.GetLiveCiphertexts() 
+        return self.backend.GetLiveCiphertexts()
 

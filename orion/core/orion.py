@@ -117,10 +117,10 @@ class Scheme:
     def decrypt(self, ctxt):
         self._check_initialization()
         return self.encryptor.decrypt(ctxt)
-    
+
     def fit(self, net, input_data, batch_size=128):
         self._check_initialization()
-        
+
         net.set_scheme(self)
         net.set_margin(self.params.get_margin())
 

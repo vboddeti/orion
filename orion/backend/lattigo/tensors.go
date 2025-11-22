@@ -2,8 +2,10 @@ package main
 
 import (
 	"C"
+	"unsafe"
 
 	"github.com/baahl-nyu/lattigo/v6/core/rlwe"
+	"github.com/baahl-nyu/lattigo/v6/schemes/ckks"
 )
 
 var (
@@ -120,4 +122,26 @@ func GetLiveCiphertexts() (*C.int, C.ulong) {
 	ids := ctHeap.GetLiveKeys()
 	arrPtr, length := SliceToCArray(ids, convertIntToCInt)
 	return arrPtr, length
+}
+
+//export SerializeCiphertext
+func SerializeCiphertext(ciphertextID C.int) (*C.char, C.ulong) {
+	ciphertext := RetrieveCiphertext(int(ciphertextID))
+	data, err := ciphertext.MarshalBinary()
+	if err != nil {
+		panic(err)
+	}
+	arrPtr, length := SliceToCArray(data, convertByteToCChar)
+	return arrPtr, length
+}
+
+//export DeserializeCiphertext
+func DeserializeCiphertext(dataPtr *C.char, lenData C.ulong) C.int {
+	ctSerial := CArrayToByteSlice(unsafe.Pointer(dataPtr), uint64(lenData))
+	ct := ckks.NewCiphertext(*scheme.Params, 1, 0)
+	if err := ct.UnmarshalBinary(ctSerial); err != nil {
+		panic(err)
+	}
+	idx := PushCiphertext(ct)
+	return C.int(idx)
 }

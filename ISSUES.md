@@ -1,0 +1,5 @@
+- [ ] The test_pcnn_backbone.py was working previously with error of 0.7, but not I am getting extremely large errors. Something is wrong.
+- [ ] What starting levels is optimal for latency? Can you do some calculations?
+- [ ] When output_size=(2,2) instead of (4,4), there is mismatch in output dim of cleartext and ciphertext when running test_pcnn_backbone.py
+- [ ] I now want to run the full PCNN, I implemented it in test_pcnn.py. check the code to ensure there are no issues. Ideally, I want to run the N backbones in parallel, rather than sequentially in a for loop
+- [ ] I am getting "panic: level cannot be larger than max level" when running test_pcnn.py. Don't think we get it when running test_pcnn_backbone.py

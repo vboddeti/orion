@@ -15,7 +15,7 @@ orion.set_log_level('INFO')
 torch.manual_seed(42)
 
 # Initialize the Orion scheme, model, and data
-scheme = orion.init_scheme("../configs/resnet.yml")
+scheme = orion.init_scheme("configs/resnet.yml")
 trainloader, testloader = get_cifar_datasets(data_dir="../data", batch_size=1)
 net = models.ResNet20()
 

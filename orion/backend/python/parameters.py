@@ -86,7 +86,7 @@ class CKKSParameters:
 @dataclass
 class OrionParameters:
     """Orion-specific configuration parameters."""
-    
+
     batch_size: int = 1
     margin: int = 2
     fuse_modules: bool = True
@@ -109,7 +109,7 @@ class OrionParameters:
             error_msg = f"Margin must be >= 1, got {self.margin}"
             logger.error(error_msg)
             raise ValueError(error_msg)
-        
+
         # Validate backend
         valid_backends = {"lattigo", "openfhe", "heaan"}
         if self.backend.lower() not in valid_backends:
@@ -260,7 +260,7 @@ class NewParameters:
     
     def get_margin(self) -> int:
         return self.orion_params.margin
-    
+
     def get_fuse_modules(self) -> bool:
         return self.orion_params.fuse_modules
     

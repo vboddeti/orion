@@ -24,8 +24,8 @@ func NewEvaluator() {
 
 func AddPo2RotationKeys() {
 	maxSlots := scheme.Params.MaxSlots()
-	// Generate all positive power-of-two rotation keys
-	for i := 1; i < maxSlots; i *= 2 {
+	// Generate all positive power-of-two rotation keys, including maxSlots itself
+	for i := 1; i <= maxSlots; i *= 2 {
 		AddRotationKey(C.int(i))
 	}
 }
@@ -322,3 +322,4 @@ func DeleteRotationKeys() {
 	liveRotKeys = make(map[uint64]*rlwe.GaloisKey)
 	savedRotKeys = []uint64{}
 }
+

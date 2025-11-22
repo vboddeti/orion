@@ -6,6 +6,7 @@ using HerPN activations and ChannelSquare operations.
 """
 
 import math
+from concurrent.futures import ThreadPoolExecutor
 
 import torch
 import torch.nn as nn
@@ -27,31 +28,43 @@ class ChannelSquare(Module):
         self.set_depth()
 
     def compile(self):
-        input_level = self.level + self.depth
-        
+        # self.level represents the INPUT level (confirmed by LevelDAG and bootstrap placement)
+        # Output level = self.level - self.depth
+        input_level = self.level
+        output_level = self.level - self.depth
+
         # Use the actual shape recorded during forward pass, fallback to fhe_input_shape
         target_shape = getattr(self, '_actual_fhe_input_shape', self.fhe_input_shape)
         if target_shape is None:
             raise ValueError(f"Cannot compile {self.__class__.__name__}: no input shape recorded")
-        
+
         target_shape = list(target_shape)
-        
+
+        # Helper to convert scalar or tensor to target shape
+        def to_tensor(w):
+            if isinstance(w, (int, float)):
+                return torch.full(target_shape, w, dtype=torch.float32)
+            else:
+                return w.expand(target_shape)
+
         if self.weight2_raw is not None:
-            # Expand weights to match the actual input shape
-            w2 = self.weight2_raw.expand(target_shape)
-            w1 = self.weight1_raw.expand(target_shape)
-            w0 = self.weight0_raw.expand(target_shape)
-            
+            # Quadratic: w2*x² + w1*x + w0
+            # x@L → x²@(L-1) → w2*x²@(L-2), w1*x@(L-1) → rescales to L-2 → add w0@(L-2)
+            w2 = to_tensor(self.weight2_raw)
+            w1 = to_tensor(self.weight1_raw)
+            w0 = to_tensor(self.weight0_raw)
+
             self.w2_fhe = self.scheme.encoder.encode(w2, input_level - 1)
             self.w1_fhe = self.scheme.encoder.encode(w1, input_level)
-            self.w0_fhe = self.scheme.encoder.encode(w0, self.level)
+            self.w0_fhe = self.scheme.encoder.encode(w0, output_level)
         else:
-            # Expand weights to match the actual input shape
-            w1 = self.weight1_raw.expand(target_shape)
-            w0 = self.weight0_raw.expand(target_shape)
-            
+            # Linear: w1*x + w0 (depth=1)
+            # x@L → x²@(L-1), w1*x@(L-1) → add w0@(L-1)
+            w1 = to_tensor(self.weight1_raw)
+            w0 = to_tensor(self.weight0_raw)
+
             self.w1_fhe = self.scheme.encoder.encode(w1, input_level)
-            self.w0_fhe = self.scheme.encoder.encode(w0, self.level)
+            self.w0_fhe = self.scheme.encoder.encode(w0, output_level)
 
     def extra_repr(self):
         return (
@@ -557,7 +570,7 @@ class PatchCNN(on.Module):
     for classification. Designed for FHE-friendly operations.
     """
 
-    def __init__(self, input_size, patch_size, num_classes=10):
+    def __init__(self, input_size, patch_size, sqrt_weights, output_size=(4,4)):
         super(PatchCNN, self).__init__()
 
         self.input_size = input_size
@@ -565,8 +578,7 @@ class PatchCNN(on.Module):
         self.H = input_size // patch_size
         self.W = input_size // patch_size
         self.N = self.H * self.W
-
-        output_size = (2, 2)
+        
         self.dim = output_size[0] * output_size[1] * 64
 
         # Create backbone networks for each patch
@@ -574,15 +586,11 @@ class PatchCNN(on.Module):
             [Backbone(output_size, input_size=patch_size) for _ in range(self.N)]
         )
 
-        # Global classification head
-        self.linear = on.Linear(self.N * self.dim, 256)
-        self.bn = on.BatchNorm1d(256)
+        self.linear = nn.ModuleList(
+            [on.Linear(self.dim, 1024) for _ in range(self.N)]
+        )
 
-        # Output layer
-        self.fc = on.Linear(256, num_classes)
-
-        # Jigsaw puzzle auxiliary task (for training only, not used in FHE)
-        self.jigsaw = on.Linear(self.dim, self.N)
+        self.normalization = ChannelSquare(sqrt_weights[0], sqrt_weights[1])
 
     def forward(self, x):
         """
@@ -609,39 +617,62 @@ class PatchCNN(on.Module):
                 patches.append(patch)
 
         # Process each patch through its backbone
-        y = []
-        for i in range(N):
-            y_i = self.nets[i](patches[i])
-            y.append(y_i)
-
-        # Stack patch features: (N, B, dim) -> (B, N, dim)
-        out = torch.stack(y, dim=0)  # (N, B, dim)
-        out = out.permute(1, 0, 2)  # (B, N, dim)
-
         if not self.he_mode:
-            # Training mode: include jigsaw task
-            B, N, _ = out.shape
-
-            # Global classification path
-            out_global = out.reshape(B, -1)  # (B, N*dim)
-            out_global = self.linear(out_global)
-            out_global = self.bn(out_global)
-            out_global = self.fc(out_global)
-
-            # Jigsaw puzzle auxiliary task
-            # Reshape to (B*N, dim) for jigsaw layer
-            out_jigsaw = out.reshape(B * N, -1)  # (B*N, dim)
-            pred = self.jigsaw(out_jigsaw)  # (B*N, N)
-            target = torch.arange(0, N, device=out.device).repeat(B)
-
-            return out_global, pred, target
+            # Cleartext mode: sequential processing is fine
+            y = 0
+            for i in range(N):
+                y_i = self.nets[i](patches[i])
+                y_i = self.linear[i](y_i)
+                y = y + y_i  # Aggregate features
         else:
-            # FHE inference mode: only classification
-            out = out.reshape(B, -1)  # (B, N*dim)
-            out = self.linear(out)
-            out = self.bn(out)
-            out = self.fc(out)
-            return out
+            # FHE mode: parallel processing of independent patches
+            # Each patch goes through a different backbone network
+            def process_patch(i):
+                """Process a single patch through its backbone and linear layer."""
+                y_i = self.nets[i](patches[i])
+                y_i = self.linear[i](y_i)
+                return y_i
+
+            # Execute all N backbones in parallel
+            # ThreadPoolExecutor works well because FHE operations in Lattigo (Go)
+            # release the GIL, allowing true parallelism
+            with ThreadPoolExecutor(max_workers=N) as executor:
+                y_outputs = list(executor.map(process_patch, range(N)))
+
+            # Use binary tree reduction for efficient parallel addition
+            # Reduces sequential depth from N to log2(N)
+            y = self._tree_reduce_add(y_outputs)
+
+        out = self.normalization(y)
+
+        return out
+
+    def _tree_reduce_add(self, tensors):
+        """
+        Binary tree reduction for parallel addition.
+
+        Reduces sequential addition depth from N to log2(N).
+        Example with 4 patches:
+            [a, b, c, d] -> [(a+b), (c+d)] -> [(a+b+c+d)]
+            Depth: 2 instead of 4
+
+        Args:
+            tensors: List of tensors to sum
+
+        Returns:
+            Single tensor with all values summed
+        """
+        while len(tensors) > 1:
+            new_tensors = []
+            for i in range(0, len(tensors), 2):
+                if i + 1 < len(tensors):
+                    # Pair-wise addition (can be done in parallel)
+                    new_tensors.append(tensors[i] + tensors[i + 1])
+                else:
+                    # Odd one out, carry forward
+                    new_tensors.append(tensors[i])
+            tensors = new_tensors
+        return tensors[0]
 
     def init_orion_params(self):
         """Initialize HerPN parameters for all backbone networks."""
