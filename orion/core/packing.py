@@ -154,10 +154,10 @@ def construct_conv2d_toeplitz(conv_layer, weight):
     N, on_Ci, on_Hi, on_Wi = conv_layer.fhe_input_shape
     on_Co, on_Ho, on_Wo = conv_layer.fhe_output_shape[1:]
     Ho, Wo = conv_layer.output_shape[2:]
-   
+
     P = conv_layer.padding[0]
     D = conv_layer.dilation[0]
-    iG = conv_layer.input_gap 
+    iG = conv_layer.input_gap
     oG = conv_layer.output_gap
     kH, kW = weight.shape[2:]
 
@@ -259,19 +259,47 @@ def pack_linear(linear_layer: nn.Module, last: bool):
     return diagonals, output_rotations
 
 def construct_linear_matrix(linear_layer):
-    if len(linear_layer.input_shape) == 2:
+    """
+    Construct the weight matrix for FHE linear layer evaluation.
+    
+    The decision of whether to multiplex weights depends on the FHE packing:
+    - If fhe_input_shape is 2D: input is densely packed, use raw weight matrix
+    - If fhe_input_shape is 4D: input is spatially packed (possibly with gap), 
+      need to multiplex weights to match the packed layout
+    """
+    layer_name = getattr(linear_layer, "name", "Linear")
+    input_gap = getattr(linear_layer, 'input_gap', 1)
+    
+    # Use fhe_input_shape as the source of truth for packing decision
+    fhe_input_is_2d = len(linear_layer.fhe_input_shape) == 2
+    
+    if fhe_input_is_2d:
+        # Densely packed 2D input (e.g., linear after linear layer)
         N = linear_layer.input_shape[0]
         matrix = linear_layer.on_weight 
-    else: # Prior layer was not a linear layer
+    else:
+        # Spatially packed 4D input (e.g., linear after conv/bn with gap)
         out_features = linear_layer.out_features
-        input_gap = linear_layer.input_gap 
-        N, Ci, Hi, Wi = linear_layer.input_shape 
+        in_features = linear_layer.in_features
+        N = linear_layer.input_shape[0]
         on_Ci, on_Hi, on_Wi = linear_layer.fhe_input_shape[1:]
         
+        # Derive spatial dimensions (Ci, Hi, Wi) for weight reshaping
+        if len(linear_layer.input_shape) == 4:
+            # Cleartext input is also 4D, use directly
+            _, Ci, Hi, Wi = linear_layer.input_shape
+        else:
+            # Cleartext input is 2D but FHE input is 4D (packed)
+            # Infer spatial dimensions from FHE shape and gap
+            Hi = on_Hi // input_gap if input_gap > 1 else on_Hi
+            Wi = on_Wi // input_gap if input_gap > 1 else on_Wi
+            Ci = in_features // (Hi * Wi)
+
         reshaped = linear_layer.on_weight.reshape(out_features, Ci, Hi, Wi)
         reshaped = multiplex(reshaped, input_gap)
 
         matrix = torch.zeros(out_features, on_Ci, on_Hi, on_Wi)
+
         matrix[..., :Hi*input_gap, :Wi*input_gap] = reshaped 
         matrix = matrix.reshape(out_features, -1)
    
@@ -506,12 +534,98 @@ def plot_toeplitz(matrix, save_path=""):
 #---------------------#
 
 def pack_bn1d(bn1d_layer):
+    """Pack BatchNorm1d parameters accounting for FHE gap and flattened inputs.
+    
+    When Flatten layer precedes BN, the input looks like (N, num_features).
+    But the FHE ciphertext often retains the spatial structure (N, C, H, W) 
+    in a multiplexed form. We need to reconstruct the (C, H, W) structure,
+    map the BN parameters to it, and multiplex it to match the FHE layout.
+    """
     N = bn1d_layer.input_shape[0]
+    
+    # Get FHE input shape and gap (set by tracer)
+    fhe_input_shape = getattr(bn1d_layer, 'fhe_input_shape', None)
+    input_gap = getattr(bn1d_layer, 'input_gap', 1)
+    
     on_running_mean = bn1d_layer.on_running_mean
     on_inv_running_std = 1 / torch.sqrt(bn1d_layer.running_var + bn1d_layer.eps)
     on_weight = bn1d_layer.on_weight if bn1d_layer.affine else None 
     on_bias = bn1d_layer.on_bias if bn1d_layer.affine else None 
+    
+    # If we have FHE shape info and gap > 1, apply multiplexing logic
+    if fhe_input_shape is not None and input_gap > 1:
+        on_Ci, on_Hi, on_Wi = fhe_input_shape[1:]
+        
+        # Deduce original spatial dims (Hi, Wi) from multiplexed dims
+        # logic: on_Hi = Hi * gap, on_Wi = Wi * gap
+        Hi = on_Hi // input_gap
+        Wi = on_Wi // input_gap
+        
+        num_features = bn1d_layer.num_features
+        # Deduce original channels Ci
+        # num_features = Ci * Hi * Wi
+        if Hi * Wi > 0:
+            Ci = num_features // (Hi * Wi)
+        else:
+            Ci = num_features # Fallback if spatial is 0? shouldn't happen
+            
+        if Ci * Hi * Wi != num_features:
+            ORION_LOGGER.warning(f"Deduced layout size {Ci*Hi*Wi} != num_features {num_features}. Fallback to simple packing.")
+            # Fallback code at end
+        else:
+            # Reshape params to (1, Ci, Hi, Wi)
+            # The params are in order of Flatten: C slow, H medium, W fast
+            mean = on_running_mean.reshape(1, Ci, Hi, Wi)
+            std = on_inv_running_std.reshape(1, Ci, Hi, Wi)
+            
+            # Multiplex matches `pool_scale` logic
+            mean_mpx = multiplex(mean, input_gap).squeeze(0)
+            std_mpx = multiplex(std, input_gap).squeeze(0)
+            
+            # Pad to matching FHE shape if needed (multiplex pads channels, but we check if we need more padding)
+            # multiplex output shape: (Co * gap^2, Hi/gap?? No, pixel_shuffle: (Co, Hi*gap, Wi*gap))
+            # Wait, multiplex in packing.py:
+            # padded = torch.zeros(N, Co * gap**2, Hi, Wi)
+            # padded[:, :Ci, ...] = matrix
+            # return F.pixel_shuffle(padded, gap) 
+            # Output: (N, Co, Hi*gap, Wi*gap)
+            # Here FHE shape is (1, on_Ci, on_Hi, on_Wi).
+            # on_Ci should match Co. on_Hi matches Hi*gap. 
+            
+            # Map into the full tensor size (in case multiplex returns smaller view or we need to place it specially)
+            # Actually multiplex returns exactly what we need for the valid data. 
+            # We just need to ensure the tensor fits the reported FHE shape.
+            
+            mC, mH, mW = mean_mpx.shape
+            
+            mean_out = torch.zeros(on_Ci, on_Hi, on_Wi)
+            std_out = torch.zeros(on_Ci, on_Hi, on_Wi)
+            weight_out = torch.zeros(on_Ci, on_Hi, on_Wi) if on_weight is not None else None
+            bias_out = torch.zeros(on_Ci, on_Hi, on_Wi) if on_bias is not None else None
+            
+            # Copy into target tensor (handles any potential padding mismatch, though dimensions should align)
+            # Usually mC=on_Ci, mH=on_Hi, mW=on_Wi.
+            mean_out[:mC, :mH, :mW] = mean_mpx
+            std_out[:mC, :mH, :mW] = std_mpx
+            
+            if on_weight is not None:
+                weight = on_weight.reshape(1, Ci, Hi, Wi)
+                weight_mpx = multiplex(weight, input_gap).squeeze(0)
+                weight_out[:mC, :mH, :mW] = weight_mpx
+                
+            if on_bias is not None:
+                bias = on_bias.reshape(1, Ci, Hi, Wi)
+                bias_mpx = multiplex(bias, input_gap).squeeze(0)
+                bias_out[:mC, :mH, :mW] = bias_mpx
+            
+            return (
+                mean_out.flatten().repeat(N),
+                std_out.flatten().repeat(N), 
+                weight_out.flatten().repeat(N) if weight_out is not None else None,
+                bias_out.flatten().repeat(N) if bias_out is not None else None
+            )
 
+    # Fallback / No gap
     return (
         on_running_mean.flatten().repeat(N),
         on_inv_running_std.flatten().repeat(N),

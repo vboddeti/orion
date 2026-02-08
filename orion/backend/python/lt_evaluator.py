@@ -31,7 +31,9 @@ class NewEvaluator:
 
         # Generate all linear transforms block by block.
         lintransf_ids = {}        
+
         for (row, col), diags in diagonals.items(): 
+
             diags_idxs, diags_data = [], []
             for idx, diag in diags.items(): 
                 diags_idxs.append(idx)
@@ -49,7 +51,7 @@ class NewEvaluator:
                 self.save_plaintext_diagonals(
                     layer_name, lintransf_id, row, col, diags_idxs
                 )
-
+        
         return lintransf_ids
     
     def get_required_rotation_keys(self, transform_id):
@@ -167,9 +169,12 @@ class NewEvaluator:
                     self.load_rotation_keys(t_id)
                     self.load_plaintext_diagonals(layer_name, i, j, t_id)
 
-                res = self.backend.EvaluateLinearTransform(t_id, in_ctensor.ids[j]) 
-                ct = CipherTensor(self.scheme, res, out_shape, fhe_out_shape)
+                # DEBUG: Check input properties
+                in_id = in_ctensor.ids[j]
 
+                res = self.backend.EvaluateLinearTransform(t_id, in_ctensor.ids[j])  
+                ct = CipherTensor(self.scheme, res, out_shape, fhe_out_shape)
+                
                 # Accumulate results across a row of blocks
                 ct_out = ct if j == 0 else ct_out + ct
                     
@@ -178,7 +183,9 @@ class NewEvaluator:
                     self.remove_plaintext_diagonals(t_id)
             
             # We know the output of this accumulation will just be one ciphertext
+
             ct_out_rescaled = self.evaluator.rescale(ct_out.ids[0], in_place=False)
+            
             cts_out.append(ct_out_rescaled)
 
         return CipherTensor(self.scheme, cts_out, out_shape, fhe_out_shape)

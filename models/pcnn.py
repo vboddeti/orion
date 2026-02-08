@@ -59,6 +59,7 @@ class ScaleModule(Module):
             scale_expanded = self.scale_raw.unsqueeze(0).expand(fhe_shape)
             self.scale_fhe = self.scheme.encoder.encode(scale_expanded, self.level)
 
+    @timer
     def forward(self, x):
         if self.he_mode:
             # FHE mode: use pre-encoded expanded scale
@@ -215,16 +216,7 @@ class L2NormPoly(Module):
         self.register_buffer('running_var', torch.ones(num_features))
 
     def compile(self):
-        """Prepare FHE-encoded constants."""
-        input_level = self.level
-        output_level = self.level - self.depth
-
-        fhe_shape = self.fhe_input_shape
-        if fhe_shape is None:
-            raise ValueError(f"Cannot compile {self.__class__.__name__}: no input shape recorded")
-
-        fhe_shape = list(fhe_shape)
-
+        """Prepare FHE-encoded constants for manual polynomial evaluation."""
         # Store coefficient values for runtime encoding
         self.a_value = self.a
         self.b_value = self.b
@@ -241,37 +233,33 @@ class L2NormPoly(Module):
             Normalized tensor of shape (B, num_features)
         """
         if self.he_mode:
-            # Compute sum of squares: y = sum(x²)
+            # Step 1: Compute sum of squares: y = sum(x²)
             x_sq = x * x
+            
             y = self._sum_reduction_fhe(x_sq)
 
-            # Apply polynomial: norm_inv = a*y² + b*y + c
+            # Step 2: Apply polynomial manually: norm_inv = a*y² + b*y + c
             y_sq = y * y
 
-            a_fhe = self.scheme.encoder.encode(
-                torch.full_like(y_sq, self.a_value),
-                y_sq.level(),
-                y_sq.scale()
-            )
-            term_a = a_fhe * y_sq
+            # Use scalar multiplication instead of plaintext encoding
+            # This uses evaluator.mul_scalar which handles small values better
+            term_a = y_sq * self.a_value
 
-            b_fhe = self.scheme.encoder.encode(
-                torch.full_like(y, self.b_value),
-                y.level(),
-                y.scale()
-            )
-            term_b = b_fhe * y
+            term_b = y * self.b_value
+
+            # Align levels before addition: drop term_b to match term_a's level
+            if term_b.level() > term_a.level():
+                term_b = term_b.mod_switch_to(term_a)
 
             poly = term_a + term_b
 
-            c_fhe = self.scheme.encoder.encode(
-                torch.full_like(poly, self.c_value),
-                poly.level(),
-                poly.scale()
-            )
-            norm_inv = poly + c_fhe
+            norm_inv = poly + self.c_value
 
-            # Normalize: x * norm_inv
+            # Step 3: Normalize: x * norm_inv
+            # Need to align x to match norm_inv's level before multiplication
+            if x.level() > norm_inv.level():
+                x = x.mod_switch_to(norm_inv)
+
             x_norm = x * norm_inv
             return x_norm
         else:
@@ -298,11 +286,17 @@ class L2NormPoly(Module):
         Returns:
             Sum tensor of shape (B, 1)
         """
-        # For now, use sequential sum (can be optimized with rotations later)
-        # This works because we're summing along the feature dimension
-        result = x[:, 0:1]  # Start with first feature
-        for i in range(1, self.num_features):
-            result = result + x[:, i:i+1]
+        # Use logarithmic rotate-and-sum reduction
+        # This sums all features into every slot (cyclic convolution)
+        # yielding the total sum in every slot of the result.
+        # This avoids unsupported slicing and is much more efficient (O(logN) vs O(N)).
+        
+        result = x
+        steps = int(math.log2(self.num_features))
+        for i in range(steps):
+            shift = 1 << i
+            # Sum with rotated version
+            result = result + result.roll(shift)
 
         return result
 
@@ -649,11 +643,7 @@ class HerPNConv(on.Module):
                     if not hasattr(self, 'shortcut_bn_fused') or not self.shortcut_bn_fused:
                         shortcut = self.shortcut_bn(shortcut)
 
-                # Debug logging (disabled by default)
-                main_min, main_max = out.min().item(), out.max().item()
-                short_min, short_max = shortcut.min().item(), shortcut.max().item()
                 out = out + shortcut
-                add_min, add_max = out.min().item(), out.max().item()
 
                 return out
             else:
@@ -816,9 +806,7 @@ class HerPNPool(on.Module):
             self.pool_scale.output_max = self.herpn.output_max
             # Shape will be recorded during forward pass
 
-        # Copy level if it exists
-        if hasattr(self.herpn, 'level'):
-            self.pool_scale.level = self.herpn.level
+        # NOTE: Do NOT copy level here - it will be copied in compile() after bootstrap placement
 
     def compile(self, trace=None):
         """Compile the HerPN module and pool scale.
@@ -860,10 +848,40 @@ class HerPNPool(on.Module):
                         self.herpn.input_shape = input_shape
                     if input_gap is not None:
                         self.herpn.input_gap = input_gap
+                    
+                    # CRITICAL FIX: Copy bootstrap hooks if present
+                    # The traced module has the hook attached by BootstrapPlacer, but self.herpn is a new instance
+                    if hasattr(mod, '_forward_hooks') and mod._forward_hooks:
+                        self.herpn._forward_hooks = mod._forward_hooks
+                    else:
+                        pass
+                    
+                    if hasattr(mod, 'bootstrapper'):
+                        self.herpn.bootstrapper = mod.bootstrapper
+                    else:
+                        pass
 
         if self.herpn is not None and hasattr(self.herpn, 'compile'):
             if hasattr(self.herpn, 'level') and self.herpn.level is not None:
                 self.herpn.compile()
+
+        # Copy level and shape attributes from traced pool_scale to this pool_scale (after bootstrap placement has updated levels)
+        # pool_scale is created during init_orion_params, so it's not in the original trace
+        # But it IS in the traced model after init_orion_params is called
+        if hasattr(self, 'pool_scale') and trace is not None:
+            # Look for pool_scale in the traced model
+            for name, mod in trace.named_modules():
+                if 'herpnpool' in name and 'pool_scale' in name:
+                    if hasattr(mod, 'level') and mod.level is not None:
+                        # Copy all attributes needed for compilation
+                        self.pool_scale.level = mod.level
+                        if hasattr(mod, 'fhe_input_shape'):
+                            self.pool_scale.fhe_input_shape = mod.fhe_input_shape
+                        if hasattr(mod, 'input_shape'):
+                            self.pool_scale.input_shape = mod.input_shape
+                        if hasattr(mod, 'input_gap'):
+                            self.pool_scale.input_gap = mod.input_gap
+                        break
 
         # Compile pool scale module
         if hasattr(self, 'pool_scale') and hasattr(self.pool_scale, 'compile'):
@@ -943,6 +961,9 @@ class Backbone(on.Module):
 
         # Final batch norm
         self.bn = on.BatchNorm1d(output_size[0] * output_size[1] * 64)
+        
+        # Flag to track if BN has been fused into linear
+        self._bn_fused = False
 
     def forward(self, x):
         out = self.conv(x)
@@ -953,7 +974,9 @@ class Backbone(on.Module):
         out = self.layer5(out)
         out = self.herpnpool(out)
         out = self.flatten(out)
-        out = self.bn(out)
+        # Skip BN if it has been fused into the following linear layer
+        if not self._bn_fused:
+            out = self.bn(out)
         return out
 
     def init_orion_params(self):
@@ -964,6 +987,81 @@ class Backbone(on.Module):
         self.layer4.init_orion_params()
         self.layer5.init_orion_params()
         self.herpnpool.init_orion_params()
+        # Initialize final BatchNorm parameters (only if not fused)
+        if not self._bn_fused:
+            self.bn.init_orion_params()
+
+    def fuse_bn_into_linear(self, linear_layer):
+        """
+        Fuse BatchNorm1d into the following Linear layer.
+        
+        This saves 1 level of FHE depth by combining:
+            y = Linear(BN(x)) 
+        into:
+            y = FusedLinear(x)
+        
+        Math:
+            BN: z = γ * (x - μ) / √(σ² + ε) + β
+            Linear: y = W @ z + b
+            
+            Fused: y = W_fused @ x + b_fused
+            where:
+                s = γ / √(σ² + ε)
+                W_fused = W @ diag(s)  (for 1D input, this is row-wise scaling)
+                b_fused = W @ (s * (-μ) + β) + b
+                
+        For BatchNorm1d followed by Linear, the input to Linear is already
+        normalized, so we need to scale the Linear weights accordingly.
+        
+        Args:
+            linear_layer: The on.Linear layer following this backbone's BN
+        """
+        if self._bn_fused:
+            print("[Backbone] BN already fused, skipping")
+            return
+            
+        bn = self.bn
+        eps = bn.eps if hasattr(bn, 'eps') else 1e-5
+        
+        # Get BN parameters
+        running_mean = bn.running_mean  # (256,)
+        running_var = bn.running_var    # (256,)
+        gamma = bn.weight               # (256,) - learnable scale
+        beta = bn.bias                  # (256,) - learnable shift
+        
+        # Compute scaling factor: s = γ / √(σ² + ε)
+        s = gamma / torch.sqrt(running_var + eps)  # (256,)
+        
+        # Get Linear parameters
+        W = linear_layer.weight.data  # (out_features, in_features) = (256, 256)
+        b = linear_layer.bias.data if linear_layer.bias is not None else torch.zeros(W.shape[0])
+        
+        # Fuse weights:
+        # Original: y = W @ (s * (x - μ) + β) + b
+        #         = W @ (s*x - s*μ + β) + b
+        #         = (W @ diag(s)) @ x + W @ (-s*μ + β) + b
+        #
+        # W_fused = W @ diag(s) = W * s (broadcast over columns)
+        # b_fused = W @ (-s*μ + β) + b
+        
+        W_fused = W * s.unsqueeze(0)  # (256, 256) * (1, 256) -> (256, 256)
+        bn_bias_term = -s * running_mean + beta  # (256,)
+        b_fused = W @ bn_bias_term + b  # (256,)
+        
+        # Update Linear layer weights
+        linear_layer.weight.data = W_fused
+        if linear_layer.bias is not None:
+            linear_layer.bias.data = b_fused
+        else:
+            linear_layer.bias = nn.Parameter(b_fused)
+        
+        # Mark BN as fused
+        self._bn_fused = True
+        
+        print(f"[Backbone] Fused BN into Linear layer")
+        print(f"  BN scale range: [{s.min():.4f}, {s.max():.4f}]")
+        print(f"  W_fused range: [{W_fused.min():.4f}, {W_fused.max():.4f}]")
+        print(f"  b_fused range: [{b_fused.min():.4f}, {b_fused.max():.4f}]")
 
 
 class PatchCNN(on.Module):

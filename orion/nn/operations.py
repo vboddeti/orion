@@ -35,11 +35,32 @@ class Mult(Module):
         return x * y
     
 
+class Rescale(Module):
+    """Explicit rescale operation that consumes one level.
+
+    This module marks an explicit rescaling point in the computation graph,
+    allowing the level assignment algorithm to account for it properly.
+    In Lattigo, the actual rescaling happens automatically when there's a
+    level mismatch, but having an explicit Rescale module prevents surprise
+    implicit rescales that introduce uncontrolled errors.
+
+    This is similar to SEAL's explicit rescale_to_next_inplace() approach.
+    """
+    def __init__(self):
+        super().__init__()
+        self.set_depth(1)  # Consumes one level
+
+    def forward(self, x):
+        # Pass-through in both cleartext and FHE mode
+        # Lattigo handles the actual rescaling automatically when needed
+        return x
+
+
 class Bootstrap(Module):
     def __init__(self, input_min, input_max, input_level):
         super().__init__()
-        self.input_min = input_min 
-        self.input_max = input_max 
+        self.input_min = input_min
+        self.input_max = input_max
         self.input_level = input_level
         self.prescale = 1
         self.postscale = 1

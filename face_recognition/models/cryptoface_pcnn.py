@@ -105,9 +105,11 @@ class CryptoFacePCNN(on.Module):
         else:
             # Default coefficients (will be overridden when loading checkpoint)
             # Using LFW default from estimate_l2_norm.py
-            a, b, c = 2.41e-07, -2.44e-04, 1.09e-01
+            # UPDATE: Recalculated for input range [100, 3000] to fix accuracy
+            # Old (wrong range): 2.41e-07, -2.44e-04, 1.09e-01
+            a, b, c = 1.057367e-08, -4.753845e-05, 7.176193e-02
             self.normalization = L2NormPoly(a, b, c, embedding_dim)
-            print(f"L2 normalization: Using default coefficients (will be loaded from checkpoint)")
+            print(f"L2 normalization: Using updated coefficients for range [100, 3000]")
 
         self.he_mode = False
 
@@ -116,30 +118,30 @@ class CryptoFacePCNN(on.Module):
         Forward pass for CryptoFace PCNN.
 
         Args:
-            x: Input tensor of shape (B, C, H, W)
+            x: Input tensor of shape (B, C, H, W) OR a list of patch tensors.
 
         Returns:
             out: Embedding tensor of shape (B, embedding_dim)
-
-        Processing flow:
-            1. Extract N patches from input
-            2. Process each patch through its backbone → 256 features
-            3. Apply per-patch linear transformation → embedding_dim features
-            4. Sum features across patches → aggregated embedding
-            5. Apply normalization → final embedding
         """
-        B = x.shape[0]
-        H, W = self.H, self.W
+        if isinstance(x, (list, tuple)):
+            patches = x
+        elif torch.is_tensor(x):
+            B = x.shape[0]
+            H, W = self.H, self.W
+            P = self.patch_size
+
+            # Extract patches: (B, C, H_img, W_img) → N × (B, C, P, P)
+            patches = []
+            for h in range(H):
+                for w in range(W):
+                    patch = x[:, :, h * P : (h + 1) * P, w * P : (w + 1) * P]
+                    patches.append(patch)
+        else:
+            # During tracing, x is a Proxy (not a list or tensor),
+            # so we treat it as the list input for FHE mode.
+            patches = x
+
         N = self.N
-        P = self.patch_size
-
-        # Extract patches: (B, C, H_img, W_img) → N × (B, C, P, P)
-        patches = []
-        for h in range(H):
-            for w in range(W):
-                patch = x[:, :, h * P : (h + 1) * P, w * P : (w + 1) * P]
-                patches.append(patch)
-
         # Process each patch through backbone + linear
         if not self.he_mode:
             # Cleartext mode: sequential processing
@@ -197,15 +199,22 @@ class CryptoFacePCNN(on.Module):
             tensors = new_tensors
         return tensors[0]
 
-    def init_orion_params(self):
+    def init_orion_params(self, fuse_bn_linear=True):
         """
         Initialize HerPN parameters for all backbone networks.
 
         This must be called BEFORE orion.fit() to ensure correct fusion.
         See: docs/CUSTOM_FIT_WORKFLOW.md
+        
+        Args:
+            fuse_bn_linear: If True, fuse backbone BN into following Linear layer
+                           to save 1 level of FHE depth (default: True)
         """
-        for net in self.nets:
+        for i, net in enumerate(self.nets):
             net.init_orion_params()
+            # Fuse BN into the following Linear layer
+            if fuse_bn_linear:
+                net.fuse_bn_into_linear(self.linear[i])
 
     def he(self):
         """Switch model to homomorphic encryption mode."""

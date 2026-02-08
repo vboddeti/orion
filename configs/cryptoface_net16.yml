@@ -1,0 +1,47 @@
+comment: "CryptoFaceNet16 - 128×128 input, 4×4 patches (16 total), 256-dim embedding"
+
+model:
+  name: "CryptoFaceNet16"
+  input_size: 128
+  patch_size: 32
+  num_patches: 16  # 4×4 grid
+  embedding_dim: 256
+
+ckks_params:
+  LogN: 16  # poly_modulus_degree = 2^16 = 65536
+
+  # Lattigo/Orion requires HOMOGENEOUS LogQ (all same modulus size)
+  # Bootstrap primes must be in LogP, NOT in LogQ!
+  #
+  # CryptoFaceNet16 configuration: 16 computation levels
+  # Same as CryptoFace original design for 128×128 input
+  #
+  # Configuration:
+  # - LogQ: 16 homogeneous computation levels (all 46) - matches CryptoFace
+  # - LogP: 3 auxiliary primes for key switching (all 55)
+  # - Bootstrap restores to level 16, allowing multiple refresh cycles
+  # - Q[0]/Scale = 2^55/2^46 = 512 > 256 (safe for bootstrap)
+  LogQ: [55, 46, 46, 46, 46, 46, 46, 46, 46, 46, 46, 46, 46, 46, 46, 46]  # 16 levels
+
+  # Bootstrap auxiliary primes (separate from main computation modulus)
+  LogP: [55, 55, 55]  # 3 for key switching
+
+  LogScale: 46  # Scale = 2^46 (matching CryptoFace)
+  H: 192  # Hamming weight for secret key
+  RingType: standard
+
+boot_params:
+  # Bootstrap parameters configured for multiple invocations
+  LogP: [55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55]  # 14 primes for bootstrap circuit
+
+orion:
+  margin: 2  # >= 1, controls scaling range during bootstrap (not placement!)
+  embedding_method: hybrid  # [hybrid, square]
+  backend: lattigo  # [lattigo, openfhe, heaan]
+
+  fuse_modules: true
+  debug: true
+
+  diags_path: ../data/diagonals.h5  # "path/to/diags" | ""
+  keys_path: ../data/keys.h5  # "path/to/keys" | ""
+  io_mode: none  # "load" | "save" | "none"
