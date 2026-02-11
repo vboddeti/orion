@@ -89,6 +89,7 @@ func (ha *HeapAllocator) Reset() {
 	ha.InterfaceMap = make(map[int]*interface{})
 }
 
+// GetLiveKeys returns all active keys.
 func (ha *HeapAllocator) GetLiveKeys() []int {
 	keys := make([]int, 0, len(ha.InterfaceMap))
 	for k := range ha.InterfaceMap {

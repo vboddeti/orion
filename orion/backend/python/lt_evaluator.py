@@ -31,7 +31,9 @@ class NewEvaluator:
 
         # Generate all linear transforms block by block.
         lintransf_ids = {}        
+
         for (row, col), diags in diagonals.items(): 
+
             diags_idxs, diags_data = [], []
             for idx, diag in diags.items(): 
                 diags_idxs.append(idx)
@@ -49,7 +51,7 @@ class NewEvaluator:
                 self.save_plaintext_diagonals(
                     layer_name, lintransf_id, row, col, diags_idxs
                 )
-
+        
         return lintransf_ids
     
     def get_required_rotation_keys(self, transform_id):
@@ -103,10 +105,10 @@ class NewEvaluator:
             layer.create_dataset("on_bias", data=on_bias.numpy())
             layer.create_dataset("input_shape", data=list(input_shape))
             layer.create_dataset("output_shape", data=list(output_shape))
-            layer.create_dataset("input_min", data=input_min.item())
-            layer.create_dataset("input_max", data=input_max.item())
-            layer.create_dataset("output_min", data=output_min.item())
-            layer.create_dataset("output_max", data=output_max.item())
+            layer.create_dataset("input_min", data=input_min)
+            layer.create_dataset("input_max", data=input_max)
+            layer.create_dataset("output_min", data=output_min)
+            layer.create_dataset("output_max", data=output_max)
 
             diags_group = layer.require_group("diagonals", track_order=True)
             for (row, col), diags in diagonals.items():
@@ -167,9 +169,12 @@ class NewEvaluator:
                     self.load_rotation_keys(t_id)
                     self.load_plaintext_diagonals(layer_name, i, j, t_id)
 
-                res = self.backend.EvaluateLinearTransform(t_id, in_ctensor.ids[j]) 
-                ct = CipherTensor(self.scheme, res, out_shape, fhe_out_shape)
+                # DEBUG: Check input properties
+                in_id = in_ctensor.ids[j]
 
+                res = self.backend.EvaluateLinearTransform(t_id, in_ctensor.ids[j])  
+                ct = CipherTensor(self.scheme, res, out_shape, fhe_out_shape)
+                
                 # Accumulate results across a row of blocks
                 ct_out = ct if j == 0 else ct_out + ct
                     
@@ -178,7 +183,9 @@ class NewEvaluator:
                     self.remove_plaintext_diagonals(t_id)
             
             # We know the output of this accumulation will just be one ciphertext
+
             ct_out_rescaled = self.evaluator.rescale(ct_out.ids[0], in_place=False)
+            
             cts_out.append(ct_out_rescaled)
 
         return CipherTensor(self.scheme, cts_out, out_shape, fhe_out_shape)
@@ -302,7 +309,9 @@ class NewEvaluator:
                 self.backend.LoadRotationKey(serial_key, int(key))
 
     def remove_rotation_keys(self):
-        self.backend.RemoveRotationKeys() 
+        self.backend.RemoveRotationKeys()
 
     def remove_plaintext_diagonals(self, transform_id):
         self.backend.RemovePlaintextDiagonals(transform_id)
+
+

@@ -7,7 +7,124 @@ import torch.nn.functional as F
 import scipy.sparse as sp
 import matplotlib.pyplot as plt
 
-from tqdm import tqdm
+# tqdm not used; Rich progress is used for packing visualization
+
+# Rich debug UI
+import logging
+from rich.console import Console, Group
+from rich.panel import Panel
+from rich.table import Table
+from rich import box
+from rich.progress import Progress, BarColumn
+from rich.live import Live
+from rich.columns import Columns
+from .logger import THEME, logger as ORION_LOGGER
+from typing import Optional
+
+# Module-level console consistent with project theme
+_CONSOLE = Console(emoji=True, theme=THEME)
+
+# Global live layout to render multiple cards side-by-side
+_PACKING_LIVE: Optional[Live] = None
+_PACKING_CARDS: list = []
+
+def _update_live():
+    global _PACKING_LIVE
+    if _PACKING_LIVE is None:
+        _PACKING_LIVE = Live(
+            Columns(_PACKING_CARDS, equal=False, expand=False, padding=(0, 0)),
+            console=_CONSOLE,
+            refresh_per_second=12,
+            transient=False,
+        )
+        _PACKING_LIVE.start()
+    else:
+        _PACKING_LIVE.update(
+            Columns(_PACKING_CARDS, equal=False, expand=False, padding=(0, 0))
+        )
+
+# --------------------- Rich helpers --------------------- #
+def _fmt(value):
+    """Format a value for display, using '-' when missing."""
+    if value is None:
+        return "-"
+    try:
+        # torch.Size -> tuple string for readability
+        if isinstance(value, torch.Size):
+            return str(tuple(value))
+        return str(value)
+    except Exception:
+        return "-"
+
+
+def _compute_bar_width(embed_method, original_shape, num_blocks, block_height,
+                       resized_shape, output_rotations, elapsed, total_diagonals):
+    """Estimate a good bar width to match the table width.
+
+    We compute width ≈ max_label + 1 + max_value to align with the 2-column grid.
+    This keeps the progress bar visually the same width as the card content.
+    """
+    labels = [
+        "embed method:",
+        "original shape:",
+        "# blocks (r,c):",
+        "block height:",
+        "resized shape:",
+        "output rotations:",
+        "time to pack (s):",
+        "# diagonals:",
+    ]
+    values = [
+        _fmt(embed_method),
+        _fmt(original_shape),
+        _fmt(num_blocks),
+        _fmt(block_height),
+        _fmt(resized_shape),
+        _fmt(output_rotations),
+        _fmt(elapsed),
+        _fmt(total_diagonals),
+    ]
+    label_max = max(len(s) for s in labels)
+    value_max = max(len(str(v)) for v in values)
+    width = label_max + 1 + value_max
+    # Clamp to reasonable min/max to avoid giant or tiny bars
+    return max(18, min(64, width))
+
+
+def _packing_panel(
+    *,
+    title: str,
+    embed_method=None,
+    original_shape=None,
+    num_blocks=None,
+    block_height=None,
+    resized_shape=None,
+    output_rotations=None,
+    elapsed=None,
+    total_diagonals=None,
+    progress_renderable=None,
+):
+    """Build a Rich panel summarizing packing details for a single layer."""
+    table = Table.grid(padding=(0, 0))
+    table.expand = False
+    table.add_row("[muted]embed method:[/]", f"[value]{_fmt(embed_method)}[/]")
+    table.add_row("[muted]original shape:[/]", f"[value]{_fmt(original_shape)}[/]")
+    table.add_row("[muted]# blocks (r,c):[/]", f"[value]{_fmt(num_blocks)}[/]")
+    table.add_row("[muted]block height:[/]", f"[value]{_fmt(block_height)}[/]")
+    table.add_row("[muted]resized shape:[/]", f"[value]{_fmt(resized_shape)}[/]")
+    table.add_row("[muted]output rotations:[/]", f"[value]{_fmt(output_rotations)}[/]")
+    table.add_row("[muted]time to pack (s):[/]", f"[value]{_fmt(elapsed)}[/]")
+    table.add_row("[muted]# diagonals:[/]", f"[value]{_fmt(total_diagonals)}[/]")
+
+    content = Group(progress_renderable, table) if progress_renderable is not None else table
+
+    return Panel.fit(
+        content,
+        title=f"[primary]{title}[/]",
+        border_style="frame",
+        box=box.ROUNDED,
+        padding=(0, 1),
+    )
 
 #-------------------#
 #   Packing Logic   #
@@ -22,7 +139,14 @@ def pack_conv2d(conv_layer: nn.Module, last: bool):
         weight = resolve_grouped_conv(conv_layer)
 
     toeplitz = construct_conv2d_toeplitz(conv_layer, weight)
-    diagonals, output_rotations = diagonalize(toeplitz, slots, embed_method, last)
+    diagonals, output_rotations = diagonalize(
+        toeplitz,
+        slots,
+        embed_method,
+        last,
+        debug=conv_layer.scheme.params.get_debug_status(),
+        layer_name=getattr(conv_layer, "name", "Conv2d"),
+    )
     
     return diagonals, output_rotations
 
@@ -30,12 +154,12 @@ def construct_conv2d_toeplitz(conv_layer, weight):
     N, on_Ci, on_Hi, on_Wi = conv_layer.fhe_input_shape
     on_Co, on_Ho, on_Wo = conv_layer.fhe_output_shape[1:]
     Ho, Wo = conv_layer.output_shape[2:]
-   
+
     P = conv_layer.padding[0]
     D = conv_layer.dilation[0]
-    iG = conv_layer.input_gap 
+    iG = conv_layer.input_gap
     oG = conv_layer.output_gap
-    kW, kH = weight.shape[2:]
+    kH, kW = weight.shape[2:]
 
     def compute_first_kernel_position():
         mpx_anchors = valid_image_indices[:, :iG, :iG].reshape(-1, 1)
@@ -124,23 +248,58 @@ def pack_linear(linear_layer: nn.Module, last: bool):
     embed_method = linear_layer.scheme.params.get_embedding_method()
 
     weight = construct_linear_matrix(linear_layer)
-    diagonals, output_rotations = diagonalize(weight, slots, embed_method, last)
+    diagonals, output_rotations = diagonalize(
+        weight,
+        slots,
+        embed_method,
+        last,
+        debug=linear_layer.scheme.params.get_debug_status(),
+        layer_name=getattr(linear_layer, "name", "Linear"),
+    )
     return diagonals, output_rotations
 
 def construct_linear_matrix(linear_layer):
-    if len(linear_layer.input_shape) == 2:
+    """
+    Construct the weight matrix for FHE linear layer evaluation.
+    
+    The decision of whether to multiplex weights depends on the FHE packing:
+    - If fhe_input_shape is 2D: input is densely packed, use raw weight matrix
+    - If fhe_input_shape is 4D: input is spatially packed (possibly with gap), 
+      need to multiplex weights to match the packed layout
+    """
+    layer_name = getattr(linear_layer, "name", "Linear")
+    input_gap = getattr(linear_layer, 'input_gap', 1)
+    
+    # Use fhe_input_shape as the source of truth for packing decision
+    fhe_input_is_2d = len(linear_layer.fhe_input_shape) == 2
+    
+    if fhe_input_is_2d:
+        # Densely packed 2D input (e.g., linear after linear layer)
         N = linear_layer.input_shape[0]
         matrix = linear_layer.on_weight 
-    else: # Prior layer was not a linear layer
+    else:
+        # Spatially packed 4D input (e.g., linear after conv/bn with gap)
         out_features = linear_layer.out_features
-        input_gap = linear_layer.input_gap 
-        N, Ci, Hi, Wi = linear_layer.input_shape 
+        in_features = linear_layer.in_features
+        N = linear_layer.input_shape[0]
         on_Ci, on_Hi, on_Wi = linear_layer.fhe_input_shape[1:]
         
+        # Derive spatial dimensions (Ci, Hi, Wi) for weight reshaping
+        if len(linear_layer.input_shape) == 4:
+            # Cleartext input is also 4D, use directly
+            _, Ci, Hi, Wi = linear_layer.input_shape
+        else:
+            # Cleartext input is 2D but FHE input is 4D (packed)
+            # Infer spatial dimensions from FHE shape and gap
+            Hi = on_Hi // input_gap if input_gap > 1 else on_Hi
+            Wi = on_Wi // input_gap if input_gap > 1 else on_Wi
+            Ci = in_features // (Hi * Wi)
+
         reshaped = linear_layer.on_weight.reshape(out_features, Ci, Hi, Wi)
         reshaped = multiplex(reshaped, input_gap)
 
         matrix = torch.zeros(out_features, on_Ci, on_Hi, on_Wi)
+
         matrix[..., :Hi*input_gap, :Wi*input_gap] = reshaped 
         matrix = matrix.reshape(out_features, -1)
    
@@ -184,6 +343,9 @@ def diagonalize(
     num_slots: int,
     embed_method: str,
     is_last_layer: bool,
+    *,
+    debug: bool = False,
+    layer_name: Optional[str] = None,
 ):
     """
     For each (slots, slots) block of the input matrix, this function 
@@ -232,9 +394,6 @@ def diagonalize(
     matrix_height, matrix_width = matrix.shape
     num_block_rows = math.ceil(matrix_height / num_slots)
     num_block_cols = math.ceil(matrix_width / num_slots)
-    print(f"├── embed method: {embed_method}")
-    print(f"├── original matrix shape: {matrix.shape}")
-    print(f"├── # blocks (rows, cols) = {(num_block_rows, num_block_cols)}")
 
     if num_block_rows == 1 and embed_method == "hybrid" and not is_last_layer:
         block_height = 2 ** math.ceil(math.log2(matrix_height))
@@ -246,9 +405,6 @@ def diagonalize(
     # Inflate dimensions of the sparse matrix
     matrix.resize(num_block_rows * block_height, num_block_cols * num_slots)
 
-    print(f"├── resized matrix shape: {matrix.shape}")
-    print(f"├── # output rotations: {output_rotations}")
-
     # Prepare indices for diagonal extraction 
     row_idx = torch.arange(block_height).repeat(num_slots // block_height)
     col_idx = torch.arange(block_height)[:, None] + torch.arange(num_slots)[None, :]
@@ -257,13 +413,53 @@ def diagonalize(
     diagonals_by_block = {}
     total_diagonals = 0
 
-    # Process each block 
-    progress_bar = tqdm(
-        total=num_block_rows * num_block_cols,
-        desc="|    Processing blocks",
-        leave=False,
-    )
+    # Decide whether to render Rich cards/progress based on logger level
+    show_cards = ORION_LOGGER.getEffectiveLevel() == logging.INFO
+
     start_time = time.time()
+
+    # Optional Rich UI setup
+    if show_cards:
+        # Compute a bar width that matches the card content
+        bar_width = _compute_bar_width(
+            embed_method,
+            (matrix_height, matrix_width),
+            (num_block_rows, num_block_cols),
+            block_height,
+            matrix.shape,
+            output_rotations,
+            "-",
+            "-",
+        )
+        progress = Progress(
+            BarColumn(bar_width=bar_width),
+            expand=False,
+            console=_CONSOLE,
+            transient=False,
+        )
+        task = progress.add_task("", total=num_block_rows * num_block_cols)
+
+        # Initial panel with placeholders
+        title = f"{layer_name or 'Layer'}"
+        panel = _packing_panel(
+            title=title,
+            embed_method=embed_method,
+            original_shape=(matrix_height, matrix_width),
+            num_blocks=(num_block_rows, num_block_cols),
+            block_height=block_height,
+            resized_shape=matrix.shape,
+            output_rotations=output_rotations,
+            elapsed="-",
+            total_diagonals="-",
+            progress_renderable=progress,
+        )
+
+        # Append to global cards and render in columns
+        idx = len(_PACKING_CARDS)
+        _PACKING_CARDS.append(panel)
+        _update_live()
+
+    # Main compute loop (no tqdm fallback)
     for block_row in range(num_block_rows):
         for block_col in range(num_block_cols):
             row_start = num_slots * block_row
@@ -286,16 +482,36 @@ def diagonalize(
                 nonzero_diagonals or {0: [0.0] * num_slots}
             )
 
-            progress_bar.set_postfix({
-                "Current Block": f"({block_row},{block_col})",
-                "Total Diagonals": total_diagonals,
-            })
-            progress_bar.update(1)
+            if show_cards:
+                progress.advance(task, 1)
+                _update_live()
 
-    progress_bar.close()
     elapsed_time = time.time() - start_time
-    print(f"├── time to pack (s): {elapsed_time:.2f}")
-    print(f"├── # diagonals = {total_diagonals}")
+
+    if show_cards:
+        # Final update with elapsed and totals
+        final_panel = _packing_panel(
+            title=title,
+            embed_method=embed_method,
+            original_shape=(matrix_height, matrix_width),
+            num_blocks=(num_block_rows, num_block_cols),
+            block_height=block_height,
+            resized_shape=matrix.shape,
+            output_rotations=output_rotations,
+            elapsed=f"{elapsed_time:.2f}",
+            total_diagonals=total_diagonals,
+            progress_renderable=progress,
+        )
+        _PACKING_CARDS[idx] = final_panel
+        _update_live()
+
+        # If this is the last layer, close the live layout and reset
+        if is_last_layer:
+            global _PACKING_LIVE
+            if _PACKING_LIVE is not None:
+                _PACKING_LIVE.stop()
+                _PACKING_LIVE = None
+            _PACKING_CARDS.clear()
 
     return diagonals_by_block, output_rotations
 
@@ -318,12 +534,98 @@ def plot_toeplitz(matrix, save_path=""):
 #---------------------#
 
 def pack_bn1d(bn1d_layer):
+    """Pack BatchNorm1d parameters accounting for FHE gap and flattened inputs.
+    
+    When Flatten layer precedes BN, the input looks like (N, num_features).
+    But the FHE ciphertext often retains the spatial structure (N, C, H, W) 
+    in a multiplexed form. We need to reconstruct the (C, H, W) structure,
+    map the BN parameters to it, and multiplex it to match the FHE layout.
+    """
     N = bn1d_layer.input_shape[0]
+    
+    # Get FHE input shape and gap (set by tracer)
+    fhe_input_shape = getattr(bn1d_layer, 'fhe_input_shape', None)
+    input_gap = getattr(bn1d_layer, 'input_gap', 1)
+    
     on_running_mean = bn1d_layer.on_running_mean
     on_inv_running_std = 1 / torch.sqrt(bn1d_layer.running_var + bn1d_layer.eps)
     on_weight = bn1d_layer.on_weight if bn1d_layer.affine else None 
     on_bias = bn1d_layer.on_bias if bn1d_layer.affine else None 
+    
+    # If we have FHE shape info and gap > 1, apply multiplexing logic
+    if fhe_input_shape is not None and input_gap > 1:
+        on_Ci, on_Hi, on_Wi = fhe_input_shape[1:]
+        
+        # Deduce original spatial dims (Hi, Wi) from multiplexed dims
+        # logic: on_Hi = Hi * gap, on_Wi = Wi * gap
+        Hi = on_Hi // input_gap
+        Wi = on_Wi // input_gap
+        
+        num_features = bn1d_layer.num_features
+        # Deduce original channels Ci
+        # num_features = Ci * Hi * Wi
+        if Hi * Wi > 0:
+            Ci = num_features // (Hi * Wi)
+        else:
+            Ci = num_features # Fallback if spatial is 0? shouldn't happen
+            
+        if Ci * Hi * Wi != num_features:
+            ORION_LOGGER.warning(f"Deduced layout size {Ci*Hi*Wi} != num_features {num_features}. Fallback to simple packing.")
+            # Fallback code at end
+        else:
+            # Reshape params to (1, Ci, Hi, Wi)
+            # The params are in order of Flatten: C slow, H medium, W fast
+            mean = on_running_mean.reshape(1, Ci, Hi, Wi)
+            std = on_inv_running_std.reshape(1, Ci, Hi, Wi)
+            
+            # Multiplex matches `pool_scale` logic
+            mean_mpx = multiplex(mean, input_gap).squeeze(0)
+            std_mpx = multiplex(std, input_gap).squeeze(0)
+            
+            # Pad to matching FHE shape if needed (multiplex pads channels, but we check if we need more padding)
+            # multiplex output shape: (Co * gap^2, Hi/gap?? No, pixel_shuffle: (Co, Hi*gap, Wi*gap))
+            # Wait, multiplex in packing.py:
+            # padded = torch.zeros(N, Co * gap**2, Hi, Wi)
+            # padded[:, :Ci, ...] = matrix
+            # return F.pixel_shuffle(padded, gap) 
+            # Output: (N, Co, Hi*gap, Wi*gap)
+            # Here FHE shape is (1, on_Ci, on_Hi, on_Wi).
+            # on_Ci should match Co. on_Hi matches Hi*gap. 
+            
+            # Map into the full tensor size (in case multiplex returns smaller view or we need to place it specially)
+            # Actually multiplex returns exactly what we need for the valid data. 
+            # We just need to ensure the tensor fits the reported FHE shape.
+            
+            mC, mH, mW = mean_mpx.shape
+            
+            mean_out = torch.zeros(on_Ci, on_Hi, on_Wi)
+            std_out = torch.zeros(on_Ci, on_Hi, on_Wi)
+            weight_out = torch.zeros(on_Ci, on_Hi, on_Wi) if on_weight is not None else None
+            bias_out = torch.zeros(on_Ci, on_Hi, on_Wi) if on_bias is not None else None
+            
+            # Copy into target tensor (handles any potential padding mismatch, though dimensions should align)
+            # Usually mC=on_Ci, mH=on_Hi, mW=on_Wi.
+            mean_out[:mC, :mH, :mW] = mean_mpx
+            std_out[:mC, :mH, :mW] = std_mpx
+            
+            if on_weight is not None:
+                weight = on_weight.reshape(1, Ci, Hi, Wi)
+                weight_mpx = multiplex(weight, input_gap).squeeze(0)
+                weight_out[:mC, :mH, :mW] = weight_mpx
+                
+            if on_bias is not None:
+                bias = on_bias.reshape(1, Ci, Hi, Wi)
+                bias_mpx = multiplex(bias, input_gap).squeeze(0)
+                bias_out[:mC, :mH, :mW] = bias_mpx
+            
+            return (
+                mean_out.flatten().repeat(N),
+                std_out.flatten().repeat(N), 
+                weight_out.flatten().repeat(N) if weight_out is not None else None,
+                bias_out.flatten().repeat(N) if bias_out is not None else None
+            )
 
+    # Fallback / No gap
     return (
         on_running_mean.flatten().repeat(N),
         on_inv_running_std.flatten().repeat(N),

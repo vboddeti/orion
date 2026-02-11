@@ -110,7 +110,7 @@ class BootstrapSolver:
                     next_level_dag = LevelDAG(
                         l_eff=self.l_eff, network_dag=self.network_dag, path=node_dag
                     )
-                    visited.update(node)
+                    visited.add(node)
    
                 self.full_level_dag.append(next_level_dag)
 
@@ -163,20 +163,31 @@ class BootstrapSolver:
         input_level = self.finally_solve_full_level_dag()
 
         self.assign_levels_to_layers()
+        
+        # This output helps understand the LevelDAG optimization decisions:
+        # - Shortest path shows critical path through network (determines input level)
+        # - Node→level mapping shows output level assigned to each module
+        # - For residual blocks: shortcut modules may have lower output levels,
+        #   but the critical requirement is that both paths align at addition points
+
         num_bootstraps, bootstrapper_slots = self.mark_bootstrap_locations()
+
+        # FIX: Update levels for nodes after bootstrap to account for bootstrap output level
+        self.update_levels_after_bootstrap()
 
         return input_level, num_bootstraps, bootstrapper_slots
     
     def assign_levels_to_layers(self):
         # Set each Orion module's attribute with it's level found by this
-        # algorithm. This let's linear transforms be encoded at the 
+        # algorithm. This let's linear transforms be encoded at the
         # correct level.
+
         for node in self.network_dag.nodes:
             node_module = self.network_dag.nodes[node]["module"]
             for layer in self.shortest_path:
                 name = layer.split("@")[0]
                 level = int(layer.split("=")[-1])
-                
+
                 if node == name:
                     self.network_dag.nodes[node]["level"] = level
                     if node_module:
@@ -201,27 +212,30 @@ class BootstrapSolver:
 
         for node in self.network_dag.nodes:
             node_w_level = node_map[node]
-            
-            children = self.network_dag.successors(node)
+
+            children = list(self.network_dag.successors(node))
             self.network_dag.nodes[node]["bootstrap"] = False
-            
+
             # Iterate over the layer's children to determine if their assigned
             # levels necessitate a bootstrap of the current layer.
             for child in children:
                 child_w_level = node_map[child]
                 _, curr_boots = query.estimate_bootstrap_latency(
                     node_w_level, child_w_level)
-                
+
+
+
                 total_bootstraps += curr_boots
                 if curr_boots > 0:
                     self.network_dag.nodes[node]["bootstrap"] = True
                     slots = self.get_bootstrap_slots(node)
-                    
-                    # Add bootstrapper to generate
+
+                    # Track bootstrap location for logging
                     if slots not in bootstrapper_slots:
                         bootstrapper_slots.append(slots)
                     break
 
+        # Log bootstrap placement locations
         return total_bootstraps , bootstrapper_slots
     
     def get_bootstrap_slots(self, node):
@@ -236,7 +250,152 @@ class BootstrapSolver:
         slots = int(min(max_slots, curr_slots)) # sparse bootstrapping
         
         return slots
-    
+
+    def update_levels_after_bootstrap(self):
+        """
+        After bootstrap placement, update levels for nodes that receive bootstrapped input.
+        Bootstrap outputs at max_level, but fork nodes may have been assigned lower levels
+        during the initial level assignment. This causes a mismatch where operations expect
+        input at their assigned level but receive it at max_level.
+        """
+
+        # Find all nodes marked with bootstrap
+        nodes_with_bootstrap = []
+        for node in self.network_dag.nodes:
+            if self.network_dag.nodes[node].get("bootstrap", False):
+                nodes_with_bootstrap.append(node)
+
+        if not nodes_with_bootstrap:
+            return
+
+        # For each node with bootstrap, update all successor levels
+        for node in nodes_with_bootstrap:
+            node_level = self.network_dag.nodes[node].get("level")
+
+            # Get immediate successors (fork nodes)
+            successors = list(self.network_dag.successors(node))
+
+            # Bootstrap outputs at max level
+            bootstrap_output_level = self.l_eff
+
+            # Update all successors to receive input at max level
+            for successor in successors:
+                old_level = self.network_dag.nodes[successor].get("level")
+
+                # Update the successor's level to max_level
+                self.network_dag.nodes[successor]["level"] = bootstrap_output_level
+
+                # If successor has a module, update its level attribute
+                successor_module = self.network_dag.nodes[successor].get("module")
+                if successor_module:
+                    old_module_level = getattr(successor_module, "level", None)
+                    successor_module.level = bootstrap_output_level
+
+                # Recursively update all descendants of this fork node
+                self._update_descendants_levels(successor, bootstrap_output_level)
+
+    def _update_descendants_levels(self, start_node, input_level):
+        """
+        Recursively update levels for all descendants of a node based on their depth.
+        This ensures that the entire subgraph after bootstrap has correct levels.
+
+        IMPORTANT: module.level represents the INPUT level to the operation, not output.
+        Output level = input level - depth
+        
+        CRITICAL FIX: At join nodes (where multiple paths merge), we must take the
+        MINIMUM output level from all incoming paths as the input to the join node.
+        This is because:
+        - Different paths may consume different numbers of levels
+        - The actual ciphertext level at a join point is determined by the path 
+          that consumed the MOST levels (resulting in the LOWEST output level)
+        """
+        
+        # Track the INPUT level for each node (this is what module.level should be)
+        # Key: node name, Value: the INPUT level for this node
+        node_input_levels = {start_node: input_level}
+        
+        # For computing join nodes, we also need to track OUTPUT levels from each predecessor
+        # Key: (predecessor, successor), Value: output level of predecessor
+        predecessor_outputs = {}
+        
+        # Use topological order to ensure we process all predecessors before successors
+        # This is critical for correctly handling join nodes
+        from collections import deque
+        
+        # Find all descendants that need updating
+        descendants_to_update = set()
+        queue = deque([start_node])
+        while queue:
+            node = queue.popleft()
+            if node in descendants_to_update:
+                continue
+            descendants_to_update.add(node)
+            for succ in self.network_dag.successors(node):
+                queue.append(succ)
+        
+        # Process in topological order (use network_dag's order filtered to our descendants)
+        import networkx as nx
+        topo_order = list(nx.topological_sort(self.network_dag))
+        nodes_to_process = [n for n in topo_order if n in descendants_to_update]
+        
+        for node in nodes_to_process:
+            # Get this node's input level
+            if node not in node_input_levels:
+                # This node's input level comes from its predecessors' output levels
+                predecessors_in_update = [p for p in self.network_dag.predecessors(node) 
+                                          if p in descendants_to_update]
+                
+                if not predecessors_in_update:
+                    # Node has no predecessors in our update set, use its current level
+                    current_level = self.network_dag.nodes[node].get("level", 0)
+                    node_input_levels[node] = current_level
+                else:
+                    # Get output levels from all predecessors
+                    pred_output_levels = []
+                    for pred in predecessors_in_update:
+                        if (pred, node) in predecessor_outputs:
+                            pred_output_levels.append(predecessor_outputs[(pred, node)])
+                    
+                    if pred_output_levels:
+                        # Input level = minimum of predecessor output levels (worst case path)
+                        input_lvl = min(pred_output_levels)
+                        node_input_levels[node] = input_lvl
+                    else:
+                        # Shouldn't happen, but fallback
+                        node_input_levels[node] = self.network_dag.nodes[node].get("level", 0)
+            
+            # Get module depth
+            node_module = self.network_dag.nodes[node].get("module")
+            if node_module and hasattr(node_module, "depth"):
+                depth = node_module.depth
+            else:
+                depth = 0
+            
+            # Compute output level
+            input_lvl = node_input_levels[node]
+            output_lvl = input_lvl - depth
+            
+            # Store output level for each successor
+            for succ in self.network_dag.successors(node):
+                predecessor_outputs[(node, succ)] = output_lvl
+        
+        # Apply the computed input levels to the network DAG and modules
+        for node, new_input_level in node_input_levels.items():
+            if node == start_node:
+                continue  # Don't update the start node's level
+                
+            old_level = self.network_dag.nodes[node].get("level")
+            
+            # Only update if the new level is higher (more levels available = better)
+            if new_input_level > old_level:
+                self.network_dag.nodes[node]["level"] = new_input_level
+
+                node_module = self.network_dag.nodes[node].get("module")
+                if node_module:
+                    node_module.level = new_input_level
+            elif new_input_level < old_level:
+                pass
+
     def plot_shortest_path(self, save_path="", figsize=(10,10)):
         """Plot the network digraph. For the best visualization, please install
         Graphviz and PyGraphviz."""
@@ -279,13 +438,14 @@ class BootstrapSolver:
             plt.savefig(save_path)
         plt.show()
 
-
 class BootstrapPlacer:
     def __init__(self, net, network_dag):
         self.net = net
         self.network_dag = network_dag
     
+    
     def place_bootstraps(self):
+
         for node in self.network_dag.nodes:
             if self.network_dag.nodes[node]["bootstrap"]:
                 module = self.network_dag.nodes[node]["module"]

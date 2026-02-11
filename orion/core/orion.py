@@ -6,6 +6,7 @@ import yaml
 import torch
 from tqdm import tqdm
 from torch.utils.data import DataLoader, RandomSampler
+import logging
 
 from orion.nn.module import Module
 from orion.nn.linear import LinearTransform
@@ -21,10 +22,11 @@ from orion.backend.python import (
     bootstrapper
 )
 
-from .tracer import StatsTracker, OrionTracer 
+from .tracer import OrionTracer, StatsTracker 
 from .fuser import Fuser
 from .network_dag import NetworkDAG
 from .auto_bootstrap import BootstrapSolver, BootstrapPlacer
+from .logger import logger as ORION_LOGGER
 
 
 class Scheme:
@@ -50,7 +52,7 @@ class Scheme:
     
     def __init__(self):
         self.backend = None
-        self.traced = None
+        self.trace = None
 
     def init_scheme(self, config: Union[str, Dict[str, Any]]):
         """Initializes the scheme."""
@@ -115,83 +117,58 @@ class Scheme:
     def decrypt(self, ctxt):
         self._check_initialization()
         return self.encryptor.decrypt(ctxt)
-    
+
     def fit(self, net, input_data, batch_size=128):
         self._check_initialization()
 
         net.set_scheme(self)
         net.set_margin(self.params.get_margin())
-        
+
+        # First we'll generate an FX symbolic trace of the network. This lets
+        # us mimic a forward pass through the network while tracking useful
+        # statistics below (shapes, ranges, etc) using the StatsTracker.
         tracer = OrionTracer()
-        traced = tracer.trace_model(net)
-        self.traced = traced 
+        trace = tracer.trace_model(net)
+        self.trace = trace
 
-        stats_tracker = StatsTracker(traced)
+        # An additional batch size parameter can be passed here to speed up
+        # the process of fitting data. Any tracked batch dimensions are reset 
+        # to what the user specified in the YAML file immediately afterwards.
+        temp_batch_size = batch_size
+        user_batch_size = self.params.get_batch_size()
 
-        #-----------------------------------------#
-        #   Populate layers with useful metadata  #
-        #-----------------------------------------# 
-
-        # Send input_data to the same device as the model.
+        stats_tracker = StatsTracker(trace, temp_batch_size, user_batch_size)
+        
+        # Get the location of the model (cpu, gpu, etc.) so that the data 
+        # propagated below is sent to the correct device.
         param = next(iter(net.parameters()), None)
         device = param.device if param is not None else torch.device("cpu")
+        
+        print("\n{1} Finding per-layer input/output ranges and shapes...", flush=True)
 
-        print("\n{1} Finding per-layer input/output ranges and shapes...", 
-              flush=True)
-        start = time.time()
-        if isinstance(input_data, DataLoader):
-            # Users often specify small batch sizes for FHE operations.
-            # However, fitting statistics with large datasets would take 
-            # unnecessarily long with small batches. To speed this up, we'll 
-            # temporarily increase the batch size during the statistics-fitting 
-            # step, and then restore the original batch size afterward.
-            user_batch_size = input_data.batch_size
-            if batch_size > user_batch_size:
-                dataset = input_data.dataset
-                shuffle = input_data.sampler is None or isinstance(input_data.sampler, RandomSampler)
-                
-                input_data = DataLoader(
-                    dataset=dataset,
-                    batch_size=batch_size,
-                    shuffle=shuffle,
-                    num_workers=input_data.num_workers,
-                    pin_memory=input_data.pin_memory,
-                    drop_last=input_data.drop_last
-                )
-
-            # Use this (potentially new) dataloader
-            for batch in tqdm(input_data, desc="Processing input data",
-                    unit="batch", leave=True):
-                stats_tracker.propagate(batch[0].to(device))
-
-            # Now we'll reset the batch size back to what the user specified.
-            stats_tracker.update_batch_size(user_batch_size)
-
-        elif isinstance(input_data, torch.Tensor):
-            stats_tracker.propagate(input_data.to(device)) 
-        else:
-            raise ValueError(
-                "Input data must be a torch.Tensor or DataLoader, but "
-                f"received {type(input_data)}."
-            )
+        #-------------------------------------#
+        #     Generate input/output ranges    #
+        #-------------------------------------#
+        
+        # Now pass the input data (tensor, list of tensors, dataloader, 
+        # list of dataloaders) to through the model while tracking stats.
+        stats_tracker.propagate_all(input_data, device, show_progress=True)
 
         #-------------------------------------#
         #      Fit polynomial activations     #
         #-------------------------------------#
 
-        # Now we can use the statistics we just obtained above to fit
-        # all polynomial activation functions.
-        print("\n{2} Fitting polynomials... ", end="", flush=True)
-        start = time.time()
+        # Now we can use the ranges we just obtained above to fit all
+        # Chebyshev polynomial activation functions.
+        print("\n{2} Fitting polynomials... ", flush=True)
         for module in net.modules():
             if hasattr(module, "fit") and callable(module.fit):
                 module.fit()
-        print(f"done! [{time.time()-start:.3f} secs.]")
-
+        
     def compile(self, net):
         self._check_initialization()
 
-        if self.traced is None:
+        if self.trace is None:
             raise ValueError(
                 "Network has not been fit yet! Before running orion.compile(net) "
                 "you must run orion.fit(net, input_data)."
@@ -201,7 +178,7 @@ class Scheme:
         #   Build DAG representation of neural network   #
         #------------------------------------------------#
 
-        network_dag = NetworkDAG(self.traced)
+        network_dag = NetworkDAG(self.trace)
         network_dag.build_dag()
 
         # Before fusing, we'll instantiate our own Orion parameters (e.g. 
@@ -255,11 +232,13 @@ class Scheme:
                 break
 
         # Now we can generate the diagonals 
-        print("\n{3} Generating matrix diagonals...", flush=True)
+        if ORION_LOGGER.getEffectiveLevel() != logging.INFO:
+            print("\n{3} Generating matrix diagonals...", flush=True)
         for node in topo_sort:
             module = network_dag.nodes[node]["module"]
             if isinstance(module, LinearTransform):
-                print(f"\nPacking {node}:")
+                if ORION_LOGGER.getEffectiveLevel() != logging.INFO:
+                    print(f"\nPacking {node}:")
                 module.generate_diagonals(last=(node == last_linear))
 
         #------------------------------#
@@ -267,7 +246,7 @@ class Scheme:
         #------------------------------#
 
         network_dag.find_residuals()
-        #(save_path="network.png", figsize=(8,30)) # optional plot
+        network_dag.plot(save_path="network.png", figsize=(8,30)) # optional plot
 
         print("\n{4} Running bootstrap placement... ", end="", flush=True)
         start = time.time()
@@ -278,9 +257,12 @@ class Scheme:
         print(f"├── Network requires {num_bootstraps} bootstrap "
             f"{'operation' if num_bootstraps == 1 else 'operations'}.")
 
-        #btp_solver.plot_shortest_path(
-        #    save_path="network-with-levels.png", figsize=(8,30) # optional plot
-        #)
+        btp_solver.plot_shortest_path(
+           save_path="network-with-levels.png", figsize=(8,30) # optional plot
+        )
+
+        btp_placer = BootstrapPlacer(net, network_dag)
+        btp_placer.place_bootstraps()
 
         if bootstrapper_slots:
             start = time.time()
@@ -293,9 +275,6 @@ class Scheme:
                 self.bootstrapper.generate_bootstrapper(slot_count)
             print(f"done! [{time.time()-start:.3f} secs.]")
 
-        btp_placer = BootstrapPlacer(net, network_dag)
-        btp_placer.place_bootstraps()
-
         #------------------------------------------#
         #   Compile Orion modules in the network   #
         #------------------------------------------#
@@ -306,8 +285,84 @@ class Scheme:
             module = node_attrs["module"]
             if isinstance(module, Module):
                 print(f"├── {node} @ level={module.level}", flush=True)
-                module.compile()
-                
+                if hasattr(module, 'compile') and callable(module.compile):
+                    module.compile()
+
+        # Compile container modules that have dynamically created submodules
+        # These modules are not in the DAG but may contain HerPN instances
+        # We need to pass the trace so they can look up levels from traced modules
+        print("\nCompiling container modules...", flush=True)
+        for module in net.modules():
+            # Only compile modules that have a compile() method but weren't in the DAG
+            if hasattr(module, 'compile') and callable(module.compile):
+                # Check if this is a container module (not a leaf operation)
+                module_name = module.__class__.__name__
+                if module_name in ['HerPNConv', 'HerPNPool']:
+                    print(f"├── Compiling {module_name}", flush=True)
+                    # Pass the trace so modules can look up levels
+                    if hasattr(module.compile, '__code__') and module.compile.__code__.co_argcount > 1:
+                        module.compile(self.trace)
+                    else:
+                        module.compile()
+
+        # Sync FHE-compiled attributes from traced modules to original model modules
+        # This is necessary because FX tracing may create separate module instances
+        print("\n{6} Syncing FHE attributes to original model...", flush=True)
+        trace_modules = dict(self.trace.named_modules())
+        net_modules = dict(net.named_modules())
+
+        for name, trace_mod in trace_modules.items():
+            if name in net_modules:
+                net_mod = net_modules[name]
+                # Check if they're the same object
+                is_same = (id(trace_mod) == id(net_mod))
+
+                # Sync level attribute (critical for correct FHE execution)
+                # Levels are updated after bootstrap placement, so traced module has correct levels
+                if hasattr(trace_mod, 'level'):
+                    old_level = getattr(net_mod, 'level', None)
+                    if old_level != trace_mod.level:
+                        net_mod.level = trace_mod.level
+                        same_str = "(same object)" if is_same else f"(trace={id(trace_mod)}, net={id(net_mod)})"
+                        print(f"├── Synced level to {name}: {old_level} → {trace_mod.level} {same_str}", flush=True)
+
+                # Sync depth attribute (also critical for correct level calculations)
+                if hasattr(trace_mod, 'depth'):
+                    old_depth = getattr(net_mod, 'depth', None)
+                    if old_depth != trace_mod.depth:
+                        net_mod.depth = trace_mod.depth
+                        same_str = "(same object)" if is_same else f"(trace={id(trace_mod)}, net={id(net_mod)})"
+                        print(f"├── Synced depth to {name}: {old_depth} → {trace_mod.depth} {same_str}", flush=True)
+
+                # Copy FHE-encoded weights if they exist
+                for attr_name in dir(trace_mod):
+                    if attr_name.endswith('_fhe') and hasattr(trace_mod, attr_name):
+                        fhe_attr = getattr(trace_mod, attr_name)
+                        setattr(net_mod, attr_name, fhe_attr)
+                        same_str = "(same object)" if is_same else f"(trace={id(trace_mod)}, net={id(net_mod)})"
+                        print(f"├── Synced {attr_name} to {name} {same_str}", flush=True)
+
+                # Sync all FHE plaintext-encoded attributes (_ptxt)
+                # This includes BatchNorm (on_running_mean_ptxt, on_inv_running_std_ptxt, on_weight_ptxt, on_bias_ptxt)
+                # and LinearTransform (on_bias_ptxt) attributes
+                for attr_name in dir(trace_mod):
+                    if attr_name.endswith('_ptxt') and hasattr(trace_mod, attr_name):
+                        ptxt_attr = getattr(trace_mod, attr_name)
+                        # Print level info if available (for debugging)
+                        if hasattr(ptxt_attr, 'level') and callable(ptxt_attr.level):
+                            trace_level = ptxt_attr.level()
+                            net_level = getattr(net_mod, attr_name).level() if hasattr(net_mod, attr_name) and hasattr(getattr(net_mod, attr_name), 'level') else "N/A"
+                            print(f"├── Syncing {attr_name}: trace_level={trace_level}, net_level_before={net_level}", flush=True)
+                        setattr(net_mod, attr_name, ptxt_attr)
+                        same_str = "(same object)" if is_same else f"(trace={id(trace_mod)}, net={id(net_mod)})"
+                        print(f"├── Synced {attr_name} to {name} {same_str}", flush=True)
+
+                # Sync transform_ids for LinearTransform modules
+                if hasattr(trace_mod, 'transform_ids'):
+                    net_mod.transform_ids = trace_mod.transform_ids
+                    same_str = "(same object)" if is_same else f"(trace={id(trace_mod)}, net={id(net_mod)})"
+                    print(f"├── Synced transform_ids to {name} {same_str}", flush=True)
+
         return input_level # level at which to encrypt the input.
 
     def _check_initialization(self):

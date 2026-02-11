@@ -283,6 +283,18 @@ class LattigoLibrary:
             restype=ArrayResultInt
         )
 
+        self.SerializeCiphertext = LattigoFunction(
+            self.lib.SerializeCiphertext,
+            argtypes=[ctypes.c_int],
+            restype=ArrayResultByte
+        )
+
+        self.DeserializeCiphertext = LattigoFunction(
+            self.lib.DeserializeCiphertext,
+            argtypes=[ctypes.POINTER(ctypes.c_ubyte), ctypes.c_ulong],
+            restype=ctypes.c_int
+        )
+
     def setup_key_generator(self):
         self.NewKeyGenerator = LattigoFunction(
             self.lib.NewKeyGenerator,
@@ -418,6 +430,42 @@ class LattigoLibrary:
         self.RescaleNew = LattigoFunction(
             self.lib.RescaleNew,
             argtypes=[ctypes.c_int],
+            restype=ctypes.c_int
+        )
+
+        self.DropLevel = LattigoFunction(
+            self.lib.DropLevel,
+            argtypes=[ctypes.c_int, ctypes.c_int],
+            restype=ctypes.c_int
+        )
+
+        self.DropLevelNew = LattigoFunction(
+            self.lib.DropLevelNew,
+            argtypes=[ctypes.c_int, ctypes.c_int],
+            restype=ctypes.c_int
+        )
+
+        self.SetScale = LattigoFunction(
+            self.lib.SetScale,
+            argtypes=[ctypes.c_int, ctypes.c_double],
+            restype=ctypes.c_int
+        )
+
+        self.MatchScalesInPlace = LattigoFunction(
+            self.lib.MatchScalesInPlace,
+            argtypes=[ctypes.c_int, ctypes.c_int],
+            restype=None
+        )
+
+        self.ModSwitchTo = LattigoFunction(
+            self.lib.ModSwitchTo,
+            argtypes=[ctypes.c_int, ctypes.c_int],
+            restype=ctypes.c_int
+        )
+
+        self.ModSwitchToNew = LattigoFunction(
+            self.lib.ModSwitchToNew,
+            argtypes=[ctypes.c_int, ctypes.c_int],
             restype=ctypes.c_int
         )
 

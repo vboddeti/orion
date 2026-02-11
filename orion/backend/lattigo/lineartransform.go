@@ -209,3 +209,6 @@ func RemoveRotationKeys() {
 		scheme.EvalKeys,
 	))
 }
+
+// ========================================
+// Thread-Safe Linear Transform Operations

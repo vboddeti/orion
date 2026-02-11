@@ -3,23 +3,17 @@ import math
 import torch
 import orion
 import orion.models as models
-from orion.core.utils import (
-    get_mnist_datasets,
-    mae, 
-    train_on_mnist
-)
+from orion.core.utils import get_mnist_datasets, mae
+
+orion.set_log_level('INFO')
 
 # Set seed for reproducibility
 torch.manual_seed(42)
 
 # Initialize the Orion scheme, model, and data
-scheme = orion.init_scheme("../configs/lola.yml")
+scheme = orion.init_scheme("../configs/resnet.yml")
 trainloader, testloader = get_mnist_datasets(data_dir="../data", batch_size=1)
 net = models.LoLA()
-
-# Train model (optional)
-# device = "cuda" if torch.cuda.is_available() else "cpu"
-# train_on_mnist(net, data_dir="../data", epochs=1, device=device)
 
 # Get a test batch to pass through our network
 inp, _ = next(iter(testloader))
@@ -28,17 +22,13 @@ inp, _ = next(iter(testloader))
 net.eval()
 out_clear = net(inp)
 
-# Prepare for FHE inference. 
-# Certain polynomial activation functions require us to know the precise range
-# of possible input values. We'll determine these ranges by aggregating
-# statistics from the training set and applying a tolerance factor = margin.
-orion.fit(net, trainloader)
+orion.fit(net, inp)
 input_level = orion.compile(net)
 
 # Encode and encrypt the input vector 
 vec_ptxt = orion.encode(inp, input_level)
 vec_ctxt = orion.encrypt(vec_ptxt)
-net.he()  # Switch to FHE mode
+net.he() # Switch to FHE mode
 
 # Run FHE inference
 print("\nStarting FHE inference", flush=True)

@@ -143,7 +143,6 @@ class Linear(LinearTransform):
                     f"2 dimensions (N, in_features), but got {x.dim()} " 
                     f"dimension(s): {x.shape}." + extra
         )
-            
             # If we're not in FHE inference mode, then we'll just return
             # the default PyTorch result.
             return torch.nn.functional.linear(x, self.weight, self.bias)
@@ -233,15 +232,16 @@ class Conv2d(LinearTransform):
 
     def compile(self):
         # If the user specifies an io mode = "save" or "load", then diagonals will
-        # be temporarily stored to disk to save memory. Load right before they're 
-        # needed to generate the backend transforms themselves. 
+        # be temporarily stored to disk to save memory. Load right before they're
+        # needed to generate the backend transforms themselves.
         if self.get_io_mode() != "none":
             self.diagonals, self.on_bias, self.output_rotations = self.load_transforms()
 
-        # We delay constructing the bias until now, so that any fusing can 
+        # We delay constructing the bias until now, so that any fusing can
         # modify the bias variable beforehand.
         bias = packing.construct_conv2d_bias(self)
-        self.on_bias_ptxt = self.scheme.encoder.encode(bias, self.level-self.depth)
+        bias_level = self.level - self.depth
+        self.on_bias_ptxt = self.scheme.encoder.encode(bias, bias_level)
         self.transform_ids = self.scheme.lt_evaluator.generate_transforms(self)
 
     def forward(self, x):
