@@ -419,6 +419,42 @@ class LattigoLibrary:
             restype=ctypes.c_int
         )
 
+        self.DropLevel = LattigoFunction(
+            self.lib.DropLevel,
+            argtypes=[ctypes.c_int, ctypes.c_int],
+            restype=ctypes.c_int
+        )
+
+        self.DropLevelNew = LattigoFunction(
+            self.lib.DropLevelNew,
+            argtypes=[ctypes.c_int, ctypes.c_int],
+            restype=ctypes.c_int
+        )
+
+        self.SetScale = LattigoFunction(
+            self.lib.SetScale,
+            argtypes=[ctypes.c_int, ctypes.c_double],
+            restype=ctypes.c_int
+        )
+
+        self.MatchScalesInPlace = LattigoFunction(
+            self.lib.MatchScalesInPlace,
+            argtypes=[ctypes.c_int, ctypes.c_int],
+            restype=None
+        )
+
+        self.ModSwitchTo = LattigoFunction(
+            self.lib.ModSwitchTo,
+            argtypes=[ctypes.c_int, ctypes.c_int],
+            restype=ctypes.c_int
+        )
+
+        self.ModSwitchToNew = LattigoFunction(
+            self.lib.ModSwitchToNew,
+            argtypes=[ctypes.c_int, ctypes.c_int],
+            restype=ctypes.c_int
+        )
+
         self.AddScalar = LattigoFunction(
             self.lib.AddScalar,
             argtypes=[

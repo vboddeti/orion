@@ -121,5 +121,58 @@ class Bootstrap(Module):
         return x
 
 
+class ScaleModule(Module):
+    """Simple module that scales input by a constant factor.
+
+    This wrapper is needed to avoid FHE tracer shape validation issues
+    when directly multiplying tensors with different shapes.
+    """
+    def __init__(self, scale_factor):
+        super().__init__()
+        self.scale_raw = scale_factor  # Shape: [C, 1, 1]
+        self.depth = 1  # Ciphertext multiplication consumes 1 level (requires rescaling)
+
+    def compile(self):
+        """Expand scale factor to match FHE input shape (with packing if needed)."""
+        import torch.nn.functional as F
+
+        fhe_shape = self.fhe_input_shape
+        clear_shape = getattr(self, 'input_shape', None)
+        gap = getattr(self, 'input_gap', 1)
+
+        if fhe_shape is None:
+            raise ValueError(f"Cannot compile {self.__class__.__name__}: no input shape recorded")
+
+        fhe_shape = list(fhe_shape)
+        clear_shape = list(clear_shape) if clear_shape is not None else fhe_shape
+
+        if gap > 1:
+            import math
+            scale_expanded = self.scale_raw.unsqueeze(0).expand(clear_shape)
+
+            # Pad channels to be divisible by gap² for packing
+            N, Ci, Hi, Wi = scale_expanded.shape
+            Co = math.ceil(Ci / (gap**2))
+            if Co * gap**2 != Ci:
+                padded = torch.zeros(N, Co * gap**2, Hi, Wi, dtype=scale_expanded.dtype, device=scale_expanded.device)
+                padded[:, :Ci, :, :] = scale_expanded
+                scale_expanded = padded
+
+            scale_packed = F.pixel_shuffle(scale_expanded, gap)
+            self.scale_fhe = self.scheme.encoder.encode(scale_packed, self.level)
+        else:
+            scale_expanded = self.scale_raw.unsqueeze(0).expand(fhe_shape)
+            self.scale_fhe = self.scheme.encoder.encode(scale_expanded, self.level)
+
+    @timer
+    def forward(self, x):
+        if self.he_mode:
+            # FHE mode: use pre-encoded expanded scale
+            return x * self.scale_fhe
+        else:
+            # Cleartext: direct multiplication (Python broadcasting handles [C,1,1] * [B,C,H,W])
+            return x * self.scale_raw.unsqueeze(0)
+
+
 
 

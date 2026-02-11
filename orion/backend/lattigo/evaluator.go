@@ -34,14 +34,46 @@ func AddPo2RotationKeys() {
 func AddRotationKey(rotation C.int) {
 	galEl := scheme.Params.GaloisElement(int(rotation))
 
-	// Generate the required rotation key if it doesn't exist
-	if _, exists := liveRotKeys[galEl]; !exists {
+	// Check if key exists in scheme.EvalKeys.GaloisKeys (from linear transforms)
+	// OR in liveRotKeys (from previous AddRotationKey calls)
+	keyExists := false
+	if scheme.EvalKeys != nil && scheme.EvalKeys.GaloisKeys != nil {
+		if _, exists := scheme.EvalKeys.GaloisKeys[galEl]; exists {
+			keyExists = true
+		}
+	}
+	if _, exists := liveRotKeys[galEl]; exists {
+		keyExists = true
+	}
+
+	// Generate the required rotation key if it doesn't exist anywhere
+	if !keyExists {
 		rotKey := scheme.KeyGen.GenGaloisKeyNew(galEl, scheme.SecretKey)
 		liveRotKeys[galEl] = rotKey
 
 		// CRITICAL: Update both scheme.EvalKeys and scheme.Evaluator
 		// scheme.EvalKeys is used by EvaluateLinearTransform to create new evaluators
-		allKeysList := GetValuesFromMap(liveRotKeys)
+		// Preserve existing keys from scheme.EvalKeys.GaloisKeys (e.g., from linear transforms)
+		allKeys := make(map[uint64]*rlwe.GaloisKey)
+
+		// First copy existing keys from scheme.EvalKeys
+		if scheme.EvalKeys != nil && scheme.EvalKeys.GaloisKeys != nil {
+			for k, v := range scheme.EvalKeys.GaloisKeys {
+				allKeys[k] = v
+			}
+		}
+
+		// Then add/override with keys from liveRotKeys
+		for k, v := range liveRotKeys {
+			allKeys[k] = v
+		}
+
+		// Convert to list for NewMemEvaluationKeySet
+		allKeysList := make([]*rlwe.GaloisKey, 0, len(allKeys))
+		for _, v := range allKeys {
+			allKeysList = append(allKeysList, v)
+		}
+
 		scheme.EvalKeys = rlwe.NewMemEvaluationKeySet(scheme.RelinKey, allKeysList...)
 		scheme.Evaluator = scheme.Evaluator.WithKey(scheme.EvalKeys)
 	}
@@ -88,6 +120,113 @@ func Rescale(ciphertextID C.int) C.int {
 	scheme.Evaluator.Rescale(ctIn, ctIn)
 
 	return ciphertextID
+}
+
+//export DropLevel
+func DropLevel(ciphertextID C.int, levels C.int) C.int {
+	ctIn := RetrieveCiphertext(int(ciphertextID))
+	scheme.Evaluator.DropLevel(ctIn, int(levels))
+
+	return ciphertextID
+}
+
+//export DropLevelNew
+func DropLevelNew(ciphertextID C.int, levels C.int) C.int {
+	ctIn := RetrieveCiphertext(int(ciphertextID))
+	ctOut := scheme.Evaluator.DropLevelNew(ctIn, int(levels))
+
+	idx := PushCiphertext(ctOut)
+	return C.int(idx)
+}
+
+//export SetScale
+func SetScale(ciphertextID C.int, scale C.double) C.int {
+	ctIn := RetrieveCiphertext(int(ciphertextID))
+	newScale := rlwe.NewScale(scale)
+	scheme.Evaluator.SetScale(ctIn, newScale)
+
+	return ciphertextID
+}
+
+//export MatchScalesInPlace
+func MatchScalesInPlace(ct0ID, ct1ID C.int) {
+	ct0 := RetrieveCiphertext(int(ct0ID))
+	ct1 := RetrieveCiphertext(int(ct1ID))
+
+	// Get scales
+	scale0 := ct0.Scale.Float64()
+	scale1 := ct1.Scale.Float64()
+
+	// Set both to the minimum scale (no rescaling, just adjust scale value)
+	// This is similar to SEAL's mod_switch approach
+	minScale := scale0
+	if scale1 < minScale {
+		minScale = scale1
+	}
+
+	scheme.Evaluator.SetScale(ct0, rlwe.NewScale(minScale))
+	scheme.Evaluator.SetScale(ct1, rlwe.NewScale(minScale))
+}
+
+//export ModSwitchTo
+func ModSwitchTo(ctID, targetCtID C.int) C.int {
+	ct := RetrieveCiphertext(int(ctID))
+	targetCt := RetrieveCiphertext(int(targetCtID))
+
+	// Get current and target levels
+	currentLevel := ct.Level()
+	targetLevel := targetCt.Level()
+
+	// If already at target level, nothing to do
+	if currentLevel == targetLevel {
+		return ctID
+	}
+
+	// If current level is higher, drop to target level (mod switch)
+	// This matches SEAL's mod_switch_to_inplace: only drop moduli, DON'T change scale
+	if currentLevel > targetLevel {
+		levelsToDrop := currentLevel - targetLevel
+		scheme.Evaluator.DropLevel(ct, levelsToDrop)
+		// NOTE: DropLevel changes only the level, not the scale
+		// The scale remains unchanged, which is correct
+		return ctID
+	}
+
+	// If current level is lower than target, this is an error
+	panic("ModSwitchTo: cannot switch to higher level")
+}
+
+//export ModSwitchToNew
+func ModSwitchToNew(ctID, targetCtID C.int) C.int {
+	ct := RetrieveCiphertext(int(ctID))
+	targetCt := RetrieveCiphertext(int(targetCtID))
+
+	// Create a copy
+	ctCopy := ct.CopyNew()
+
+	// Get current and target levels
+	currentLevel := ctCopy.Level()
+	targetLevel := targetCt.Level()
+
+	// If already at target level, nothing to do
+	if currentLevel == targetLevel {
+		idx := PushCiphertext(ctCopy)
+		return C.int(idx)
+	}
+
+	// If current level is higher, drop to target level (mod switch)
+	// This matches SEAL's mod_switch_to_inplace: only drop moduli, DON'T change scale
+	if currentLevel > targetLevel {
+		levelsToDrop := currentLevel - targetLevel
+		ctOut := scheme.Evaluator.DropLevelNew(ctCopy, levelsToDrop)
+		// NOTE: DropLevel changes only the level, not the scale
+		// The scale remains unchanged, which is correct
+		idx := PushCiphertext(ctOut)
+		return C.int(idx)
+	}
+
+	// If current level is lower than target, this is an error
+	panic("ModSwitchToNew: cannot switch to higher level")
 }
 
 //export RescaleNew

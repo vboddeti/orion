@@ -261,6 +261,9 @@ class Scheme:
            save_path="network-with-levels.png", figsize=(8,30) # optional plot
         )
 
+        btp_placer = BootstrapPlacer(net, network_dag)
+        btp_placer.place_bootstraps()
+
         if bootstrapper_slots:
             start = time.time()
             slots_str = ", ".join([str(int(math.log2(slot))) for slot in bootstrapper_slots])
@@ -271,9 +274,6 @@ class Scheme:
             for slot_count in bootstrapper_slots:
                 self.bootstrapper.generate_bootstrapper(slot_count)
             print(f"done! [{time.time()-start:.3f} secs.]")
-
-        btp_placer = BootstrapPlacer(net, network_dag)
-        btp_placer.place_bootstraps()
 
         #------------------------------------------#
         #   Compile Orion modules in the network   #
@@ -287,7 +287,82 @@ class Scheme:
                 print(f"├── {node} @ level={module.level}", flush=True)
                 if hasattr(module, 'compile') and callable(module.compile):
                     module.compile()
-                
+
+        # Compile container modules that have dynamically created submodules
+        # These modules are not in the DAG but may contain HerPN instances
+        # We need to pass the trace so they can look up levels from traced modules
+        print("\nCompiling container modules...", flush=True)
+        for module in net.modules():
+            # Only compile modules that have a compile() method but weren't in the DAG
+            if hasattr(module, 'compile') and callable(module.compile):
+                # Check if this is a container module (not a leaf operation)
+                module_name = module.__class__.__name__
+                if module_name in ['HerPNConv', 'HerPNPool']:
+                    print(f"├── Compiling {module_name}", flush=True)
+                    # Pass the trace so modules can look up levels
+                    if hasattr(module.compile, '__code__') and module.compile.__code__.co_argcount > 1:
+                        module.compile(self.trace)
+                    else:
+                        module.compile()
+
+        # Sync FHE-compiled attributes from traced modules to original model modules
+        # This is necessary because FX tracing may create separate module instances
+        print("\n{6} Syncing FHE attributes to original model...", flush=True)
+        trace_modules = dict(self.trace.named_modules())
+        net_modules = dict(net.named_modules())
+
+        for name, trace_mod in trace_modules.items():
+            if name in net_modules:
+                net_mod = net_modules[name]
+                # Check if they're the same object
+                is_same = (id(trace_mod) == id(net_mod))
+
+                # Sync level attribute (critical for correct FHE execution)
+                # Levels are updated after bootstrap placement, so traced module has correct levels
+                if hasattr(trace_mod, 'level'):
+                    old_level = getattr(net_mod, 'level', None)
+                    if old_level != trace_mod.level:
+                        net_mod.level = trace_mod.level
+                        same_str = "(same object)" if is_same else f"(trace={id(trace_mod)}, net={id(net_mod)})"
+                        print(f"├── Synced level to {name}: {old_level} → {trace_mod.level} {same_str}", flush=True)
+
+                # Sync depth attribute (also critical for correct level calculations)
+                if hasattr(trace_mod, 'depth'):
+                    old_depth = getattr(net_mod, 'depth', None)
+                    if old_depth != trace_mod.depth:
+                        net_mod.depth = trace_mod.depth
+                        same_str = "(same object)" if is_same else f"(trace={id(trace_mod)}, net={id(net_mod)})"
+                        print(f"├── Synced depth to {name}: {old_depth} → {trace_mod.depth} {same_str}", flush=True)
+
+                # Copy FHE-encoded weights if they exist
+                for attr_name in dir(trace_mod):
+                    if attr_name.endswith('_fhe') and hasattr(trace_mod, attr_name):
+                        fhe_attr = getattr(trace_mod, attr_name)
+                        setattr(net_mod, attr_name, fhe_attr)
+                        same_str = "(same object)" if is_same else f"(trace={id(trace_mod)}, net={id(net_mod)})"
+                        print(f"├── Synced {attr_name} to {name} {same_str}", flush=True)
+
+                # Sync all FHE plaintext-encoded attributes (_ptxt)
+                # This includes BatchNorm (on_running_mean_ptxt, on_inv_running_std_ptxt, on_weight_ptxt, on_bias_ptxt)
+                # and LinearTransform (on_bias_ptxt) attributes
+                for attr_name in dir(trace_mod):
+                    if attr_name.endswith('_ptxt') and hasattr(trace_mod, attr_name):
+                        ptxt_attr = getattr(trace_mod, attr_name)
+                        # Print level info if available (for debugging)
+                        if hasattr(ptxt_attr, 'level') and callable(ptxt_attr.level):
+                            trace_level = ptxt_attr.level()
+                            net_level = getattr(net_mod, attr_name).level() if hasattr(net_mod, attr_name) and hasattr(getattr(net_mod, attr_name), 'level') else "N/A"
+                            print(f"├── Syncing {attr_name}: trace_level={trace_level}, net_level_before={net_level}", flush=True)
+                        setattr(net_mod, attr_name, ptxt_attr)
+                        same_str = "(same object)" if is_same else f"(trace={id(trace_mod)}, net={id(net_mod)})"
+                        print(f"├── Synced {attr_name} to {name} {same_str}", flush=True)
+
+                # Sync transform_ids for LinearTransform modules
+                if hasattr(trace_mod, 'transform_ids'):
+                    net_mod.transform_ids = trace_mod.transform_ids
+                    same_str = "(same object)" if is_same else f"(trace={id(trace_mod)}, net={id(net_mod)})"
+                    print(f"├── Synced transform_ids to {name} {same_str}", flush=True)
+
         return input_level # level at which to encrypt the input.
 
     def _check_initialization(self):

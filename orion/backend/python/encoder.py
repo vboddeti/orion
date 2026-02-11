@@ -1,4 +1,5 @@
 import torch
+import torch.nn.functional as F
 from .tensors import PlainTensor
 
 class NewEncoder:
@@ -19,9 +20,9 @@ class NewEncoder:
                 f"Expected 'values' passed to encode() to be a either a list "
                 f"or a torch.Tensor, but got {type(values)}.")
 
-        if not level:
+        if level is None:
             level = self.params.get_max_level()
-        if not scale:
+        if scale is None:
             scale = self.params.get_default_scale()
 
         num_slots = self.params.get_slots()
@@ -42,12 +43,19 @@ class NewEncoder:
         return PlainTensor(self.scheme, plaintext_ids, values.shape)
 
     def decode(self, plaintensor: PlainTensor):
-        values = [] 
+        values = []
         for plaintext_id in plaintensor.ids:
             values.extend(self.backend.Decode(plaintext_id))
 
+        # Decode returns values in the packed format (on_shape)
         values = torch.tensor(values)[:plaintensor.on_shape.numel()]
-        return values.reshape(plaintensor.on_shape)
+        packed = values.reshape(plaintensor.on_shape)
+
+        # IMPORTANT: Return packed format (on_shape), NOT unpacked (shape)
+        # Hybrid packing operates on packed data throughout the network
+        # Unpacking should only happen for final output if needed
+        # For intermediate layers, the packed representation IS the correct FHE output
+        return packed
 
     def get_moduli_chain(self):
         return self.backend.GetModuliChain()

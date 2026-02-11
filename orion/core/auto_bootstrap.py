@@ -162,14 +162,11 @@ class BootstrapSolver:
 
         self.assign_levels_to_layers()
         
-        
-
         # This output helps understand the LevelDAG optimization decisions:
         # - Shortest path shows critical path through network (determines input level)
         # - Node→level mapping shows output level assigned to each module
         # - For residual blocks: shortcut modules may have lower output levels,
         #   but the critical requirement is that both paths align at addition points
-
 
         num_bootstraps, bootstrapper_slots = self.mark_bootstrap_locations()
 
@@ -208,9 +205,6 @@ class BootstrapSolver:
 
         total_bootstraps = 0
         bootstrapper_slots = []
-
-
-
 
         for node in self.network_dag.nodes:
             node_w_level = node_map[node]
@@ -439,7 +433,6 @@ class BootstrapSolver:
         if save_path:
             plt.savefig(save_path)
         plt.show()
-
 
 class BootstrapPlacer:
     def __init__(self, net, network_dag):
