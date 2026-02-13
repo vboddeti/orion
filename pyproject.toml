@@ -24,7 +24,8 @@ dependencies = [
     "pytest>=8.4.2",
     "rich>=14.2.0",
     "opt-einsum>=3.4.0",
-    "pygraphviz>=1.11", 
+    "pygraphviz>=1.11",
+    "ipython>=8.18.1",
 ]
 
 [tool.poetry]
