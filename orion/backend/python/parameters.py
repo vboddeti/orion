@@ -96,6 +96,7 @@ class OrionParameters:
     io_mode: Literal["none", "save", "load"] = "none"
     diags_path: str = ""
     keys_path: str = ""
+    final_level: int = 0
 
     def __post_init__(self):
         # Validate batch size
@@ -103,10 +104,16 @@ class OrionParameters:
             error_msg = f"Batch size must be >= 1, got {self.batch_size}"
             logger.error(error_msg)
             raise ValueError(error_msg)
-        
+
         # Validate margin
         if self.margin < 1:
             error_msg = f"Margin must be >= 1, got {self.margin}"
+            logger.error(error_msg)
+            raise ValueError(error_msg)
+
+        # Validate final level
+        if self.final_level < 0:
+            error_msg = f"Final level must be >= 0, got {self.final_level}"
             logger.error(error_msg)
             raise ValueError(error_msg)
 
@@ -142,15 +149,16 @@ class OrionParameters:
             f"  Margin: {self.margin}",
             f"  Embedding Method: {self.embedding_method}",
             f"  Fuse Modules: {self.fuse_modules}",
-            f"  Debug Mode: {self.debug}"
+            f"  Debug Mode: {self.debug}",
+            f"  Final Level: {self.final_level}"
         ]
-        
+
         output.append(f"  I/O Mode: {self.io_mode}")
         if self.diags_path:
             output.append(f"  Diagonals Path: {self.diags_path}")
         if self.keys_path:
             output.append(f"  Keys Path: {self.keys_path}")
-        
+
         return "\n".join(output)
 
 
@@ -276,6 +284,9 @@ class NewParameters:
     def get_io_mode(self) -> str:
         return self.orion_params.io_mode.lower()
 
+    def get_final_level(self) -> int:
+        return self.orion_params.final_level
+
     def get_diags_path(self) -> str:
         if not self.orion_params.diags_path:
             return ""
@@ -329,6 +340,7 @@ class NewParameters:
                 "embedding": self.get_embedding_method(),
                 "fuse_modules": self.get_fuse_modules(),
                 "debug": self.get_debug_status(),
-                "io_mode": self.get_io_mode()
+                "io_mode": self.get_io_mode(),
+                "final_level": self.get_final_level()
             }
         }

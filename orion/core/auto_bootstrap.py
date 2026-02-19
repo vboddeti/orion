@@ -7,10 +7,11 @@ from orion.nn.operations import Bootstrap
 
 
 class BootstrapSolver:
-    def __init__(self, net, network_dag, l_eff):
-        self.net = net 
-        self.network_dag = network_dag 
+    def __init__(self, net, network_dag, l_eff, final_level=0):
+        self.net = net
+        self.network_dag = network_dag
         self.l_eff = l_eff
+        self.final_level = final_level
         self.full_level_dag = LevelDAG(l_eff=l_eff, network_dag=network_dag)
 
     def extract_all_residual_subgraphs(self):
@@ -115,19 +116,48 @@ class BootstrapSolver:
                 self.full_level_dag.append(next_level_dag)
 
     def finally_solve_full_level_dag(self):
-        # Now that we've built our aggregate level DAG, we can now call 
+        # Now that we've built our aggregate level DAG, we can now call
         # one final shortest path on it to determine the optimal level
         # management policy for our network.
 
         heads = self.full_level_dag.head()
         tails = self.full_level_dag.tail()
 
-        self.full_level_dag.add_node("source", weight=0) 
-        self.full_level_dag.add_node("target", weight=0) 
+        self.full_level_dag.add_node("source", weight=0)
+        self.full_level_dag.add_node("target", weight=0)
 
-        for head, tail in zip(heads, tails):
+        for head in heads:
             self.full_level_dag.add_edge("source", head, weight=0)
-            self.full_level_dag.add_edge(tail, "target", weight=0)
+
+        # Connect tail nodes to the virtual target node, filtered by the
+        # desired minimum final output level.
+        #
+        # final_level=0  →  all tails qualify (output_level >= 0 is always
+        #                   true), recovering the original unconstrained
+        #                   behaviour.
+        # final_level=K>0 →  only tails whose output level >= K are
+        #                   connected.  The optimizer picks the cheapest
+        #                   path that still delivers at least K levels.
+        #                   If the natural output already exceeds K the
+        #                   constraint is satisfied for free.
+        for tail in tails:
+            tail_level = int(tail.split("=")[-1])
+            tail_name = tail.split("@")[0]
+            tail_module = self.network_dag.nodes[tail_name]["module"]
+            tail_op = self.network_dag.nodes[tail_name]["op"]
+
+            if tail_op == "call_function":
+                depth = 1 if "mul" in tail_name else 0
+            elif (tail_module is not None
+                  and hasattr(tail_module, "depth")
+                  and tail_module.depth is not None):
+                depth = tail_module.depth
+            else:
+                depth = 0
+
+            output_level = tail_level - depth
+            if output_level >= self.final_level:
+                self.full_level_dag.add_edge(tail, "target", weight=0)
 
         shortest_path, latency = self.full_level_dag.shortest_path(
             source="source", target="target"
@@ -135,10 +165,12 @@ class BootstrapSolver:
 
         if latency == float("inf"):
             raise ValueError(
-                "Automatic bootstrap placement failed. First try increasing "
-                "the length of your LogQ moduli chain the associated "
-                "parameters YAML file. If this fails, double check that the "
-                "network was instantiated properly."
+                f"Automatic bootstrap placement failed with final_level="
+                f"{self.final_level}. First try increasing the length of "
+                f"your LogQ moduli chain in the associated parameters YAML "
+                f"file. If this fails, double check that the network was "
+                f"instantiated properly, or adjust 'final_level' in the "
+                f"Orion config."
             )
 
         # Just remove the source/target we added

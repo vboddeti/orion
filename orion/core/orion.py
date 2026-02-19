@@ -251,7 +251,8 @@ class Scheme:
         print("\n{4} Running bootstrap placement... ", end="", flush=True)
         start = time.time()
         l_eff = len(self.params.get_logq()) - 1
-        btp_solver = BootstrapSolver(net, network_dag, l_eff=l_eff)
+        btp_solver = BootstrapSolver(net, network_dag, l_eff=l_eff,
+                                     final_level=self.params.get_final_level())
         input_level, num_bootstraps, bootstrapper_slots = btp_solver.solve()
         print(f"done! [{time.time()-start:.3f} secs.]", flush=True)
         print(f"├── Network requires {num_bootstraps} bootstrap "

@@ -251,6 +251,11 @@ class LevelDAG(nx.DiGraph):
             if prev_level - prev_module.depth <= 0:
                 return (float("inf"), 0)
 
+            # Bootstrap always resets the ciphertext to l_eff. Any edge
+            # where the successor is not at l_eff is physically impossible.
+            if curr_level != self.l_eff:
+                return (float("inf"), 0)
+
             # Analytical fit based on experiments. Once again could benefit
             # from a profiler, but the search space here is quite massive.
             a, b, c = 3.41, 0.18, 4.81

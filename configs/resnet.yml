@@ -19,6 +19,8 @@ orion:
   fuse_modules: true
   debug: true
 
+  final_level: 0 # 0 = unconstrained (original behaviour); K > 0 = guarantee output level >= K
+
   diags_path: ../data/diagonals.h5 # "path/to/diags" | ""
   keys_path: ../data/keys.h5 # "path/to/keys" | ""
   io_mode: none # "load" | "save" | "none"
