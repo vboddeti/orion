@@ -7,7 +7,7 @@ from orion.backend.python.tensors import CipherTensor
 
 class NewEvaluator:
     def __init__(self, scheme):
-        self.scheme = scheme 
+        self.scheme = scheme
         self.params = scheme.params
         self.backend = scheme.backend
         self.evaluator = scheme.evaluator
@@ -18,6 +18,7 @@ class NewEvaluator:
         self.keys_path = self.params.get_keys_path()
 
         self.saved_rotation_keys = set()
+        self._preloaded = False
         self.new_evaluator()
 
     def new_evaluator(self):
@@ -25,17 +26,17 @@ class NewEvaluator:
 
     def generate_transforms(self, linear_layer):
         layer_name = linear_layer.name
-        diagonals = linear_layer.diagonals 
+        diagonals = linear_layer.diagonals
         level = linear_layer.level
         bsgs_ratio = linear_layer.bsgs_ratio
 
         # Generate all linear transforms block by block.
-        lintransf_ids = {}        
+        lintransf_ids = {}
 
-        for (row, col), diags in diagonals.items(): 
+        for (row, col), diags in diagonals.items():
 
             diags_idxs, diags_data = [], []
-            for idx, diag in diags.items(): 
+            for idx, diag in diags.items():
                 diags_idxs.append(idx)
                 diags_data.extend(diag)
 
@@ -51,9 +52,9 @@ class NewEvaluator:
                 self.save_plaintext_diagonals(
                     layer_name, lintransf_id, row, col, diags_idxs
                 )
-        
+
         return lintransf_ids
-    
+
     def get_required_rotation_keys(self, transform_id):
         return self.backend.GetLinearTransformRotationKeys(transform_id)
 
@@ -76,7 +77,7 @@ class NewEvaluator:
                     key_str = str(key)
                     if key_str in f: # don't regenerate the key
                         continue
-                    
+
                     # We'll generate, serialize, and then save the key
                     serial_key, ptr = self.backend.GenerateAndSerializeRotationKey(key)
                     try:
@@ -86,14 +87,14 @@ class NewEvaluator:
 
     def save_transforms(self, linear_layer):
         layer_name = linear_layer.name
-        diagonals = linear_layer.diagonals 
-        on_bias = linear_layer.on_bias 
-        output_rotations = linear_layer.output_rotations 
-        input_shape = linear_layer.input_shape 
+        diagonals = linear_layer.diagonals
+        on_bias = linear_layer.on_bias
+        output_rotations = linear_layer.output_rotations
+        input_shape = linear_layer.input_shape
         output_shape = linear_layer.output_shape
         input_min = linear_layer.input_min
         input_max = linear_layer.input_max
-        output_min = linear_layer.output_min 
+        output_min = linear_layer.output_min
         output_max = linear_layer.output_max
 
         print("└── saving... ", end="", flush=True)
@@ -110,11 +111,12 @@ class NewEvaluator:
             layer.create_dataset("output_min", data=output_min)
             layer.create_dataset("output_max", data=output_max)
 
-            diags_group = layer.require_group("diagonals", track_order=True)
+            # Fix: require_group() does not accept track_order; only create_group() does.
+            diags_group = layer.require_group("diagonals")
             for (row, col), diags in diagonals.items():
                 block_idx = f"{row}_{col}"
                 block_diags_group = diags_group.create_group(block_idx, track_order=True)
-                
+
                 # Iterate over all diagonals in the block and save
                 for diag_idx, diag_data in diags.items():
                     block_diags_group.create_dataset(str(diag_idx), data=diag_data)
@@ -129,7 +131,9 @@ class NewEvaluator:
         on_bias = linear_layer.on_bias
         output_rotations = linear_layer.output_rotations
 
-        with h5py.File(self.diags_path, "a") as f:
+        # Fix: use "r" (read-only) not "a" (append) — "a" acquires an exclusive
+        # POSIX lock that blocks concurrent readers (e.g. multiple spawn workers).
+        with h5py.File(self.diags_path, "r") as f:
             layer = f[layer_name]
 
             # Load the diagonals back into the correct struct
@@ -141,17 +145,57 @@ class NewEvaluator:
                 block_group = diag_group[block]
                 for diag_idx in block_group:
                     diag_data = block_group[diag_idx][:]
-                    diags[int(diag_idx)] = diag_data 
+                    diags[int(diag_idx)] = diag_data
                 all_diagonals[(row, col)] = diags
 
         return all_diagonals, on_bias, output_rotations
 
+    def preload_all(self, net):
+        """Eagerly load all rotation keys and plaintext diagonals into Go memory.
+
+        Call once after orion.compile() when io_mode=load. After this,
+        evaluate_transforms skips all per-evaluation HDF5 I/O, giving the same
+        inference speed as io_mode=none while keeping the faster compile time.
+        """
+        if self.io_mode == "none":
+            return  # Keys and diagonals already live in Go memory.
+
+        linear_layers = [
+            m for m in net.modules()
+            if hasattr(m, "transform_ids") and hasattr(m, "name")
+        ]
+
+        # ── Load all unique rotation keys in one HDF5 pass ───────────────────
+        needed_keys = set()
+        for layer in linear_layers:
+            for t_id in layer.transform_ids.values():
+                needed_keys.update(self.get_required_rotation_keys(t_id))
+
+        with h5py.File(self.keys_path, "r") as f:
+            for key in needed_keys:
+                serial_key = f[str(key)][()]
+                self.backend.LoadRotationKey(serial_key, int(key))
+
+        # ── Load all plaintext diagonals in one HDF5 pass ────────────────────
+        with h5py.File(self.diags_path, "r") as f:
+            for layer in linear_layers:
+                ptxt_group = f[layer.name]["plaintexts"]
+                for (row, col), t_id in layer.transform_ids.items():
+                    block = ptxt_group[f"{row}_{col}"]
+                    for diag_idx in block:
+                        serial_diag = block[diag_idx][()]
+                        self.backend.LoadPlaintextDiagonal(
+                            serial_diag, t_id, int(diag_idx)
+                        )
+
+        self._preloaded = True
+
     def evaluate_transforms(self, linear_layer, in_ctensor):
         layer_name = linear_layer.name
         out_shape = linear_layer.output_shape
-        fhe_out_shape = linear_layer.fhe_output_shape 
+        fhe_out_shape = linear_layer.fhe_output_shape
 
-        # Order-preserving flatten that can be mapped back to 
+        # Order-preserving flatten that can be mapped back to
         # (row, col) format in backend via len(in_ctensor.ids)
         transform_ids = np.array(list(linear_layer.transform_ids.values()))
         cols = len(in_ctensor)
@@ -165,31 +209,31 @@ class NewEvaluator:
             for j in range(cols):
                 t_id = transform_ids[i][j]
 
-                if self.io_mode != "none":
+                if self.io_mode != "none" and not self._preloaded:
                     self.load_rotation_keys(t_id)
                     self.load_plaintext_diagonals(layer_name, i, j, t_id)
 
                 # DEBUG: Check input properties
                 in_id = in_ctensor.ids[j]
 
-                res = self.backend.EvaluateLinearTransform(t_id, in_ctensor.ids[j])  
+                res = self.backend.EvaluateLinearTransform(t_id, in_ctensor.ids[j])
                 ct = CipherTensor(self.scheme, res, out_shape, fhe_out_shape)
-                
+
                 # Accumulate results across a row of blocks
                 ct_out = ct if j == 0 else ct_out + ct
-                    
-                if self.io_mode != "none":
+
+                if self.io_mode != "none" and not self._preloaded:
                     self.remove_rotation_keys()
                     self.remove_plaintext_diagonals(t_id)
-            
+
             # We know the output of this accumulation will just be one ciphertext
 
             ct_out_rescaled = self.evaluator.rescale(ct_out.ids[0], in_place=False)
-            
+
             cts_out.append(ct_out_rescaled)
 
         return CipherTensor(self.scheme, cts_out, out_shape, fhe_out_shape)
-            
+
     def delete_transforms(self, transform_ids: dict):
         for tid in transform_ids.values():
             self.backend.DeleteLinearTransform(tid)
@@ -202,9 +246,9 @@ class NewEvaluator:
         curr_embed_method = linear_layer.scheme.params.get_embedding_method()
         curr_output_rotations = linear_layer.output_rotations
         curr_on_bias = linear_layer.on_bias
-        curr_input_shape = linear_layer.input_shape 
+        curr_input_shape = linear_layer.input_shape
         curr_output_shape = linear_layer.output_shape
-        curr_input_min = linear_layer.input_min 
+        curr_input_min = linear_layer.input_min
         curr_input_max = linear_layer.input_max
         curr_output_min = linear_layer.output_min
         curr_output_max = linear_layer.output_max
@@ -216,12 +260,12 @@ class NewEvaluator:
             # Check if the layer exists in the h5py file
             if layer_name not in f:
                 raise ValueError(
-                    f"Layer '{layer_name}' not found in file {self.diags_path}. " + 
+                    f"Layer '{layer_name}' not found in file {self.diags_path}. " +
                     "First set IO mode in parameters YAML file to `save`."
                 )
-            
+
             layer = f[layer_name]
-            
+
             last_embed_method = layer["embedding_method"][()].decode("utf-8")
             last_output_rotations = layer["output_rotations"][()]
             last_on_bias = torch.tensor(layer["on_bias"][:])
@@ -234,46 +278,46 @@ class NewEvaluator:
 
             # Check each parameter and collect mismatches
             mismatches = []
-                            
+
             if curr_on_bias.shape != last_on_bias.shape:
                 mismatches.append(f"on_bias: shape mismatch")
             elif not torch.allclose(curr_on_bias, last_on_bias):
                 mismatches.append(f"on_bias: values mismatch")
-            
+
             # Simple equality checks
             if curr_output_rotations != last_output_rotations:
                 mismatches.append(f"output_rotations mismatch")
 
             if curr_input_shape != last_input_shape:
                 mismatches.append(f"input_shape mismatch")
-            
+
             if curr_output_shape != last_output_shape:
                 mismatches.append(f"output_shape mismatch")
-            
+
             if curr_embed_method != last_embed_method:
                 mismatches.append(f"embedding_method mismatch")
-            
+
             if curr_input_min != last_input_min:
                 mismatches.append(f"input_min mismatch")
-            
+
             if curr_input_max != last_input_max:
                 mismatches.append(f"input_max mismatch")
-            
+
             if curr_output_min != last_output_min:
                 mismatches.append(f"output_min mismatch")
-            
+
             if curr_output_max != last_output_max:
                 mismatches.append(f"output_max mismatch")
-            
+
             # If there are mismatches, raise a detailed error
             if mismatches:
                 error_msg = "Saved network does not match currently instantiated network: "
                 error_msg += ", ".join(mismatches)
                 error_msg += ". First set IO mode in parameters YAML file to `save` to "
                 error_msg += "override existing data. Then loading will work."
-                
+
                 raise ValueError(error_msg)
-            
+
     def save_plaintext_diagonals(self, layer_name, lintransf_id, row, col, diag_idxs):
         with h5py.File(self.diags_path, "a") as f:
             layer = f[layer_name]
@@ -299,7 +343,7 @@ class NewEvaluator:
                 self.backend.LoadPlaintextDiagonal(
                     serial_diag, transform_id, int(diag_idx)
                 )
-    
+
     def load_rotation_keys(self, transform_id):
         keys = self.get_required_rotation_keys(transform_id)
 
@@ -313,5 +357,3 @@ class NewEvaluator:
 
     def remove_plaintext_diagonals(self, transform_id):
         self.backend.RemovePlaintextDiagonals(transform_id)
-
-
