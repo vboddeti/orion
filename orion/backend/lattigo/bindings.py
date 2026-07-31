@@ -822,6 +822,25 @@ class LattigoLibrary:
             restype=None
         )
 
+        self.GenerateAndSerializeBootstrapper = LattigoFunction(
+            self.lib.GenerateAndSerializeBootstrapper,
+            argtypes=[
+                ctypes.POINTER(ctypes.c_int), ctypes.c_int, # logPs
+                ctypes.c_int, # slots
+            ],
+            restype=ArrayResultByte
+        )
+
+        self.LoadBootstrapper = LattigoFunction(
+            self.lib.LoadBootstrapper,
+            argtypes=[
+                ctypes.POINTER(ctypes.c_int), ctypes.c_int, # logPs
+                ctypes.c_int, # slots
+                ctypes.POINTER(ctypes.c_ubyte), ctypes.c_ulong,
+            ],
+            restype=None
+        )
+
         self.Bootstrap = LattigoFunction(
             self.lib.Bootstrap,
             argtypes=[

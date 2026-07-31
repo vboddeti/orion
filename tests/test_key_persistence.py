@@ -44,3 +44,32 @@ def test_public_key_only_initialization_can_encrypt(tmp_path):
 
     assert ciphertext is not None
     assert rotated is not None
+
+
+def test_bootstrapper_keys_can_load_without_secret_key(tmp_path):
+    config = _config(tmp_path, "save")
+    config["ckks_params"].update({
+        "LogN": 12,
+        "LogQ": [50, 40, 40, 40, 40],
+        "LogP": [50, 50],
+        "LogScale": 40,
+    })
+    config["boot_params"] = {"LogP": [50, 50]}
+
+    save_scheme = orion.init_scheme(config)
+    save_scheme.bootstrapper.generate_bootstrapper(1 << 11)
+
+    load_config = _config(tmp_path, "load", load_secret_key=False)
+    load_config["ckks_params"] = config["ckks_params"]
+    load_config["boot_params"] = config["boot_params"]
+    load_scheme = orion.init_scheme(load_config)
+    load_scheme.bootstrapper.generate_bootstrapper(1 << 11)
+    plaintext = load_scheme.encode(torch.tensor([1.0]))
+    ciphertext = load_scheme.encrypt(plaintext)
+    bootstrapped_id = load_scheme.bootstrapper.bootstrap(
+        ciphertext.ids[0], 1 << 11
+    )
+
+    with h5py.File(tmp_path / "evaluation_keys.h5", "r") as keys:
+        assert "2048" in keys["bootstrappers"]
+    assert bootstrapped_id is not None
