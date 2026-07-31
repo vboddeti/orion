@@ -96,6 +96,14 @@ class OrionParameters:
     io_mode: Literal["none", "save", "load"] = "none"
     diags_path: str = ""
     keys_path: str = ""
+    # Optional separate path for the secret key. Defaults to keys_path when
+    # empty. Lets a client keep the SK private while uploading only the
+    # evaluation keys (relin/galois) in keys_path.
+    sk_path: str = ""
+    # When False (server side), the SK is neither loaded nor used: only the
+    # serialized evaluation keys (relin + galois) are loaded. Defaults True for
+    # backward compatibility.
+    load_secret_key: bool = True
     final_level: int = 0
 
     def __post_init__(self):
@@ -296,6 +304,16 @@ class NewParameters:
         if not self.orion_params.keys_path:
             return ""
         return os.path.abspath(os.path.join(os.getcwd(), self.orion_params.keys_path))
+
+    def get_sk_path(self) -> str:
+        # Falls back to keys_path when no dedicated secret-key path is set.
+        path = self.orion_params.sk_path or self.orion_params.keys_path
+        if not path:
+            return ""
+        return os.path.abspath(os.path.join(os.getcwd(), path))
+
+    def get_load_secret_key(self) -> bool:
+        return self.orion_params.load_secret_key
 
     def io_paths_exist(self) -> bool:
         return bool(self.get_diags_path()) and bool(self.get_keys_path())

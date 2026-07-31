@@ -56,3 +56,50 @@ func LoadSecretKey(dataPtr *C.char, lenData C.ulong) {
 
 	scheme.SecretKey = sk
 }
+
+//export SerializeRelinearizationKey
+func SerializeRelinearizationKey() (*C.char, C.ulong) {
+	data, err := scheme.RelinKey.MarshalBinary()
+	if err != nil {
+		panic(err)
+	}
+
+	arrPtr, length := SliceToCArray(data, convertByteToCChar)
+	return arrPtr, length
+}
+
+//export LoadRelinearizationKey
+func LoadRelinearizationKey(dataPtr *C.char, lenData C.ulong) {
+	rkSerial := CArrayToByteSlice(unsafe.Pointer(dataPtr), uint64(lenData))
+
+	rk := &rlwe.RelinearizationKey{}
+	if err := rk.UnmarshalBinary(rkSerial); err != nil {
+		panic(err)
+	}
+
+	scheme.RelinKey = rk
+	scheme.EvalKeys = rlwe.NewMemEvaluationKeySet(rk)
+}
+
+//export SerializePublicKey
+func SerializePublicKey() (*C.char, C.ulong) {
+	data, err := scheme.PublicKey.MarshalBinary()
+	if err != nil {
+		panic(err)
+	}
+
+	arrPtr, length := SliceToCArray(data, convertByteToCChar)
+	return arrPtr, length
+}
+
+//export LoadPublicKey
+func LoadPublicKey(dataPtr *C.char, lenData C.ulong) {
+	pkSerial := CArrayToByteSlice(unsafe.Pointer(dataPtr), uint64(lenData))
+
+	pk := &rlwe.PublicKey{}
+	if err := pk.UnmarshalBinary(pkSerial); err != nil {
+		panic(err)
+	}
+
+	scheme.PublicKey = pk
+}

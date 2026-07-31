@@ -338,6 +338,30 @@ class LattigoLibrary:
             restype=None
         )
 
+        self.SerializeRelinearizationKey = LattigoFunction(
+            self.lib.SerializeRelinearizationKey,
+            argtypes=[],
+            restype=ArrayResultByte
+        )
+
+        self.LoadRelinearizationKey = LattigoFunction(
+            self.lib.LoadRelinearizationKey,
+            argtypes=[ctypes.POINTER(ctypes.c_ubyte), ctypes.c_ulong],
+            restype=None
+        )
+
+        self.SerializePublicKey = LattigoFunction(
+            self.lib.SerializePublicKey,
+            argtypes=[],
+            restype=ArrayResultByte
+        )
+
+        self.LoadPublicKey = LattigoFunction(
+            self.lib.LoadPublicKey,
+            argtypes=[ctypes.POINTER(ctypes.c_ubyte), ctypes.c_ulong],
+            restype=None
+        )
+
     def setup_encoder(self):
         self.NewEncoder = LattigoFunction(
             self.lib.NewEncoder,
@@ -395,6 +419,12 @@ class LattigoLibrary:
             self.lib.AddRotationKey,
             argtypes=[ctypes.c_int],
             restype=None
+        )
+
+        self.GetRotationGaloisElement = LattigoFunction(
+            self.lib.GetRotationGaloisElement,
+            argtypes=[ctypes.c_int],
+            restype=ctypes.c_ulong
         )
 
         self.Negate = LattigoFunction(

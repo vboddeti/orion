@@ -8,11 +8,17 @@ import (
 
 //export NewEncryptor
 func NewEncryptor() {
+	if scheme.PublicKey == nil {
+		return // no public key loaded; encryption not available (e.g. decrypt-only client)
+	}
 	scheme.Encryptor = ckks.NewEncryptor(*scheme.Params, scheme.PublicKey)
 }
 
 //export NewDecryptor
 func NewDecryptor() {
+	if scheme.SecretKey == nil {
+		return // server side: no secret key loaded, decryption not available
+	}
 	scheme.Decryptor = ckks.NewDecryptor(*scheme.Params, scheme.SecretKey)
 }
 

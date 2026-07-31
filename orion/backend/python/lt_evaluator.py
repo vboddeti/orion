@@ -111,8 +111,13 @@ class NewEvaluator:
             layer.create_dataset("output_min", data=output_min)
             layer.create_dataset("output_max", data=output_max)
 
-            # Fix: require_group() does not accept track_order; only create_group() does.
-            diags_group = layer.require_group("diagonals")
+            # require_group() does not accept track_order in current h5py; use
+            # create_group when the group is new (to preserve insertion order)
+            # and fetch it otherwise.
+            if "diagonals" in layer:
+                diags_group = layer["diagonals"]
+            else:
+                diags_group = layer.create_group("diagonals", track_order=True)
             for (row, col), diags in diagonals.items():
                 block_idx = f"{row}_{col}"
                 block_diags_group = diags_group.create_group(block_idx, track_order=True)
@@ -159,6 +164,8 @@ class NewEvaluator:
         """
         if self.io_mode == "none":
             return  # Keys and diagonals already live in Go memory.
+
+        self.scheme.evaluator.preload_power_of_two_rotation_keys()
 
         linear_layers = [
             m for m in net.modules()
