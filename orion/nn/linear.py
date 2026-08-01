@@ -51,7 +51,7 @@ class LinearTransform(Module):
         pass
 
     def get_io_mode(self):
-        return self.scheme.params.get_io_mode()
+        return self.scheme.params.get_diags_io_mode()
 
     def save_transforms(self):
         self.scheme.lt_evaluator.save_transforms(self)

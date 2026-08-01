@@ -5,7 +5,7 @@ class NewEvaluator:
     def __init__(self, scheme):
         self.backend = scheme.backend
         self.params = scheme.params
-        self.io_mode = self.params.get_io_mode()
+        self.io_mode = self.params.get_key_io_mode()
         self.keys_path = self.params.get_keys_path()
         self.loaded_rotation_keys = set()
         self.new_evaluator()

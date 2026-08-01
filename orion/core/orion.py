@@ -27,6 +27,7 @@ from .fuser import Fuser
 from .network_dag import NetworkDAG
 from .auto_bootstrap import BootstrapSolver, BootstrapPlacer
 from .logger import logger as ORION_LOGGER
+from .circuit_manifest import validate_parameters
 
 
 class Scheme:
@@ -53,6 +54,7 @@ class Scheme:
     def __init__(self):
         self.backend = None
         self.trace = None
+        self.compiled_circuit = None
 
     def init_scheme(self, config: Union[str, Dict[str, Any]]):
         """Initializes the scheme."""
@@ -117,6 +119,44 @@ class Scheme:
     def decrypt(self, ctxt):
         self._check_initialization()
         return self.encryptor.decrypt(ctxt)
+
+    def generate_keys_from_manifest(self, manifest):
+        """Generate circuit-specific evaluation keys without loading a model."""
+        self._check_initialization()
+        manifest = validate_parameters(manifest, self.params)
+        if self.params.get_key_io_mode() != "save":
+            raise ValueError(
+                "generate_keys_from_manifest requires key_io_mode=save"
+            )
+        circuit = manifest["circuit"]
+        self.keygen.generate_rotation_keys(
+            circuit["rotation_galois_elements"]
+        )
+        for slots in sorted(set(circuit["bootstrap_slots"])):
+            self.bootstrapper.generate_bootstrapper(slots)
+        return manifest
+
+    def validate_compiled_manifest(self, manifest):
+        """Verify a compiled model uses only requirements declared to client."""
+        manifest = validate_parameters(manifest, self.params)
+        if self.compiled_circuit is None:
+            raise ValueError("No circuit has been compiled for validation")
+        declared = manifest["circuit"]
+        if declared.get("input_level") != self.compiled_circuit["input_level"]:
+            raise ValueError("Circuit manifest input_level does not match compilation")
+        if sorted(set(declared["bootstrap_slots"])) != (
+                self.compiled_circuit["bootstrap_slots"]):
+            raise ValueError(
+                "Circuit manifest bootstrap_slots do not match compilation"
+            )
+        missing = set(self.compiled_circuit["rotation_galois_elements"]) - set(
+            declared["rotation_galois_elements"]
+        )
+        if missing:
+            raise ValueError(
+                f"Circuit manifest is missing {len(missing)} rotation keys"
+            )
+        return manifest
 
     def fit(self, net, input_data, batch_size=128):
         self._check_initialization()
@@ -364,6 +404,13 @@ class Scheme:
                     same_str = "(same object)" if is_same else f"(trace={id(trace_mod)}, net={id(net_mod)})"
                     print(f"├── Synced transform_ids to {name} {same_str}", flush=True)
 
+        self.compiled_circuit = {
+            "input_level": input_level,
+            "bootstrap_slots": sorted(set(map(int, bootstrapper_slots))),
+            "rotation_galois_elements": sorted(
+                self.lt_evaluator.saved_rotation_keys
+            ),
+        }
         return input_level # level at which to encrypt the input.
 
     def _check_initialization(self):

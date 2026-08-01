@@ -3,7 +3,7 @@ import h5py
 class NewKeyGenerator:
     def __init__(self, scheme):
         self.backend = scheme.backend
-        self.io_mode = scheme.params.get_io_mode()
+        self.io_mode = scheme.params.get_key_io_mode()
         self.keys_path = scheme.params.get_keys_path()
         self.sk_path = scheme.params.get_sk_path()
         self.load_secret_key = scheme.params.get_load_secret_key()
@@ -70,3 +70,22 @@ class NewKeyGenerator:
         # relin key (see LoadRelinearizationKey); otherwise build it here.
         if self.io_mode != "load":
             self.backend.GenerateEvaluationKeys()
+
+    def generate_rotation_keys(self, galois_elements):
+        """Generate and persist the exact circuit rotation-key set."""
+        if self.io_mode != "save":
+            raise ValueError(
+                "Circuit rotation keys can only be generated in key_io_mode=save"
+            )
+        with h5py.File(self.keys_path, "a") as keys:
+            for galois_element in sorted(set(map(int, galois_elements))):
+                name = str(galois_element)
+                if name in keys:
+                    continue
+                serialized, pointer = self.backend.GenerateAndSerializeRotationKey(
+                    galois_element
+                )
+                try:
+                    keys.create_dataset(name, data=serialized)
+                finally:
+                    self.backend.FreeCArray(pointer)
