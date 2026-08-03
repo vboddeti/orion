@@ -156,6 +156,9 @@ func LoadRotationKey(
 	// we just loaded. This will eventually get used by the
 	// current linear transform and then deleted from RAM.
 	scheme.EvalKeys.GaloisKeys[uint64(galEl)] = &rotKey
+	// NewEvaluator is created before keys are loaded in io_mode=load, so keep
+	// the active evaluator synchronized with the growing evaluation-key set.
+	scheme.Evaluator = scheme.Evaluator.WithKey(scheme.EvalKeys)
 }
 
 //export SerializeDiagonal

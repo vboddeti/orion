@@ -94,8 +94,21 @@ class OrionParameters:
     embedding_method: Literal["hybrid", "square"] = "hybrid"
     backend: Literal["lattigo", "openfhe", "heaan"] = "lattigo"
     io_mode: Literal["none", "save", "load"] = "none"
+    # Independent persistence modes allow a client to generate keys without
+    # seeing model weights and a server to pack model diagonals without the SK.
+    # When omitted, both retain the legacy io_mode behavior.
+    key_io_mode: Optional[Literal["none", "save", "load"]] = None
+    diags_io_mode: Optional[Literal["none", "save", "load"]] = None
     diags_path: str = ""
     keys_path: str = ""
+    # Optional separate path for the secret key. Defaults to keys_path when
+    # empty. Lets a client keep the SK private while uploading only the
+    # evaluation keys (relin/galois) in keys_path.
+    sk_path: str = ""
+    # When False (server side), the SK is neither loaded nor used: only the
+    # serialized evaluation keys (relin + galois) are loaded. Defaults True for
+    # backward compatibility.
+    load_secret_key: bool = True
     final_level: int = 0
 
     def __post_init__(self):
@@ -137,6 +150,17 @@ class OrionParameters:
             error_msg = f"Invalid IO mode: {self.io_mode}. Must be one of {valid_modes}"
             logger.error(error_msg)
             raise ValueError(error_msg)
+        for name, mode in (
+            ("key_io_mode", self.key_io_mode),
+            ("diags_io_mode", self.diags_io_mode),
+        ):
+            if mode is not None and mode.lower() not in valid_modes:
+                raise ValueError(
+                    f"Invalid {name}: {mode}. Must be one of {valid_modes}"
+                )
+
+        self.key_io_mode = self.key_io_mode or self.io_mode
+        self.diags_io_mode = self.diags_io_mode or self.io_mode
         
         # pretty-print the dataclass as a dict
         logger.debug("Initialized Orion parameters:\n%s", pformat(asdict(self), sort_dicts=False))
@@ -154,6 +178,8 @@ class OrionParameters:
         ]
 
         output.append(f"  I/O Mode: {self.io_mode}")
+        output.append(f"  Key I/O Mode: {self.key_io_mode}")
+        output.append(f"  Diagonals I/O Mode: {self.diags_io_mode}")
         if self.diags_path:
             output.append(f"  Diagonals Path: {self.diags_path}")
         if self.keys_path:
@@ -202,11 +228,14 @@ class NewParameters:
             raise
 
         # Handle IO mode and file cleanup
-        if self.get_io_mode() == "save" and self.io_paths_exist():
-            logger.info("IO mode is 'save' - cleaning up existing files")
+        if self.get_key_io_mode() == "save":
             self.reset_stored_keys()
+            if self.get_sk_path() != self.get_keys_path():
+                self.reset_stored_secret_key()
+        if self.get_diags_io_mode() == "save":
             self.reset_stored_diags()
-        elif self.get_io_mode() == "load":
+        if (self.get_key_io_mode() == "load" or
+                self.get_diags_io_mode() == "load"):
             self._validate_load_paths()
         
         logger.info("Parameters initialized successfully")
@@ -218,9 +247,10 @@ class NewParameters:
     
     def _validate_load_paths(self):
         """Validate that required files exist when loading."""
-        if self.get_io_mode() == "load":
+        if self.get_diags_io_mode() == "load":
             if self.get_diags_path() and not os.path.exists(self.get_diags_path()):
                 logger.warning(f"Diagonals file not found at {self.get_diags_path()}")
+        if self.get_key_io_mode() == "load":
             if self.get_keys_path() and not os.path.exists(self.get_keys_path()):
                 logger.warning(f"Keys file not found at {self.get_keys_path()}")
 
@@ -284,6 +314,12 @@ class NewParameters:
     def get_io_mode(self) -> str:
         return self.orion_params.io_mode.lower()
 
+    def get_key_io_mode(self) -> str:
+        return self.orion_params.key_io_mode.lower()
+
+    def get_diags_io_mode(self) -> str:
+        return self.orion_params.diags_io_mode.lower()
+
     def get_final_level(self) -> int:
         return self.orion_params.final_level
 
@@ -297,12 +333,22 @@ class NewParameters:
             return ""
         return os.path.abspath(os.path.join(os.getcwd(), self.orion_params.keys_path))
 
+    def get_sk_path(self) -> str:
+        # Falls back to keys_path when no dedicated secret-key path is set.
+        path = self.orion_params.sk_path or self.orion_params.keys_path
+        if not path:
+            return ""
+        return os.path.abspath(os.path.join(os.getcwd(), path))
+
+    def get_load_secret_key(self) -> bool:
+        return self.orion_params.load_secret_key
+
     def io_paths_exist(self) -> bool:
         return bool(self.get_diags_path()) and bool(self.get_keys_path())
 
     def reset_stored_file(self, path: str, file_type: str):
-        """Remove a stored file if in save mode."""
-        if self.get_io_mode() == "save" and path:
+        """Remove a stored persistence file."""
+        if path:
             abs_path = os.path.abspath(os.path.join(os.getcwd(), path))
             if os.path.exists(abs_path):
                 logger.info(f"Deleting existing {file_type} at {abs_path}")
@@ -322,6 +368,10 @@ class NewParameters:
     def reset_stored_keys(self):
         """Remove stored keys file."""
         self.reset_stored_file(self.get_keys_path(), "keys")
+
+    def reset_stored_secret_key(self):
+        """Remove a separately stored secret-key file."""
+        self.reset_stored_file(self.get_sk_path(), "secret key")
     
     def summary(self) -> dict:
         """Get a summary of all parameters as a dictionary."""
@@ -341,6 +391,8 @@ class NewParameters:
                 "fuse_modules": self.get_fuse_modules(),
                 "debug": self.get_debug_status(),
                 "io_mode": self.get_io_mode(),
+                "key_io_mode": self.get_key_io_mode(),
+                "diags_io_mode": self.get_diags_io_mode(),
                 "final_level": self.get_final_level()
             }
         }

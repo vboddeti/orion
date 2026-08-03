@@ -13,7 +13,8 @@ class NewEvaluator:
         self.evaluator = scheme.evaluator
 
         self.embed_method = self.params.get_embedding_method()
-        self.io_mode = self.params.get_io_mode()
+        self.key_io_mode = self.params.get_key_io_mode()
+        self.diags_io_mode = self.params.get_diags_io_mode()
         self.diags_path = self.params.get_diags_path()
         self.keys_path = self.params.get_keys_path()
 
@@ -41,14 +42,14 @@ class NewEvaluator:
                 diags_data.extend(diag)
 
             lintransf_id = self.backend.GenerateLinearTransform(
-                diags_idxs, diags_data, level, bsgs_ratio, self.io_mode
+                diags_idxs, diags_data, level, bsgs_ratio, self.diags_io_mode
             )
             lintransf_ids[(row, col)] = lintransf_id
 
             # Now we can generate any new rotation keys needed for
             # this linear transform.
             self.generate_rotation_keys(lintransf_id)
-            if self.io_mode == "save":
+            if self.diags_io_mode == "save":
                 self.save_plaintext_diagonals(
                     layer_name, lintransf_id, row, col, diags_idxs
                 )
@@ -67,11 +68,11 @@ class NewEvaluator:
         keys_to_gen = set(curr_keys).difference(self.saved_rotation_keys)
         self.saved_rotation_keys.update(keys_to_gen)
 
-        if self.io_mode == "none":
+        if self.key_io_mode == "none":
             for key in keys_to_gen:
                 self.backend.GenerateLinearTransformRotationKey(key)
 
-        elif self.io_mode == "save":
+        elif self.key_io_mode == "save":
             with h5py.File(self.keys_path, "a") as f:
                 for key in keys_to_gen:
                     key_str = str(key)
@@ -111,8 +112,13 @@ class NewEvaluator:
             layer.create_dataset("output_min", data=output_min)
             layer.create_dataset("output_max", data=output_max)
 
-            # Fix: require_group() does not accept track_order; only create_group() does.
-            diags_group = layer.require_group("diagonals")
+            # require_group() does not accept track_order in current h5py; use
+            # create_group when the group is new (to preserve insertion order)
+            # and fetch it otherwise.
+            if "diagonals" in layer:
+                diags_group = layer["diagonals"]
+            else:
+                diags_group = layer.create_group("diagonals", track_order=True)
             for (row, col), diags in diagonals.items():
                 block_idx = f"{row}_{col}"
                 block_diags_group = diags_group.create_group(block_idx, track_order=True)
@@ -157,8 +163,10 @@ class NewEvaluator:
         evaluate_transforms skips all per-evaluation HDF5 I/O, giving the same
         inference speed as io_mode=none while keeping the faster compile time.
         """
-        if self.io_mode == "none":
+        if self.diags_io_mode == "none":
             return  # Keys and diagonals already live in Go memory.
+
+        self.scheme.evaluator.preload_power_of_two_rotation_keys()
 
         linear_layers = [
             m for m in net.modules()
@@ -209,7 +217,7 @@ class NewEvaluator:
             for j in range(cols):
                 t_id = transform_ids[i][j]
 
-                if self.io_mode != "none" and not self._preloaded:
+                if self.diags_io_mode != "none" and not self._preloaded:
                     self.load_rotation_keys(t_id)
                     self.load_plaintext_diagonals(layer_name, i, j, t_id)
 
@@ -222,7 +230,7 @@ class NewEvaluator:
                 # Accumulate results across a row of blocks
                 ct_out = ct if j == 0 else ct_out + ct
 
-                if self.io_mode != "none" and not self._preloaded:
+                if self.diags_io_mode != "none" and not self._preloaded:
                     self.remove_rotation_keys()
                     self.remove_plaintext_diagonals(t_id)
 

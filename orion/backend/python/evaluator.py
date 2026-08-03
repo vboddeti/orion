@@ -1,7 +1,16 @@
+import h5py
+
+
 class NewEvaluator:
     def __init__(self, scheme):
         self.backend = scheme.backend
+        self.params = scheme.params
+        self.io_mode = self.params.get_key_io_mode()
+        self.keys_path = self.params.get_keys_path()
+        self.loaded_rotation_keys = set()
         self.new_evaluator()
+        if self.io_mode in ("none", "save"):
+            self._initialize_power_of_two_rotation_keys()
 
     def new_evaluator(self):
         self.backend.NewEvaluator()
@@ -9,10 +18,55 @@ class NewEvaluator:
     def add_rotation_key(self, amount: int):
         self.backend.AddRotationKey(amount)
 
+    def _power_of_two_rotations(self):
+        amount = 1
+        while amount <= self.params.get_slots():
+            yield amount
+            amount *= 2
+
+    def _galois_element(self, amount):
+        return int(self.backend.GetRotationGaloisElement(amount))
+
+    def _initialize_power_of_two_rotation_keys(self):
+        if self.io_mode == "none":
+            for amount in self._power_of_two_rotations():
+                self.add_rotation_key(amount)
+            return
+
+        with h5py.File(self.keys_path, "a") as keys:
+            for amount in self._power_of_two_rotations():
+                galois_element = self._galois_element(amount)
+                key_name = str(galois_element)
+                if key_name in keys:
+                    continue
+                serialized, pointer = self.backend.GenerateAndSerializeRotationKey(
+                    galois_element
+                )
+                try:
+                    keys.create_dataset(key_name, data=serialized)
+                finally:
+                    self.backend.FreeCArray(pointer)
+
+    def _load_rotation_key(self, amount):
+        galois_element = self._galois_element(amount)
+        if galois_element in self.loaded_rotation_keys:
+            return
+        with h5py.File(self.keys_path, "r") as keys:
+            serialized = keys[str(galois_element)][()]
+        self.backend.LoadRotationKey(serialized, galois_element)
+        self.loaded_rotation_keys.add(galois_element)
+
+    def preload_power_of_two_rotation_keys(self):
+        if self.io_mode == "load":
+            for amount in self._power_of_two_rotations():
+                self._load_rotation_key(amount)
+
     def negate(self, ctxt):
         return self.backend.Negate(ctxt)
     
     def rotate(self, ctxt, amount, in_place):
+        if self.io_mode == "load":
+            self._load_rotation_key(amount)
         if in_place:
             return self.backend.Rotate(ctxt, amount)
         return self.backend.RotateNew(ctxt, amount)
@@ -87,4 +141,3 @@ class NewEvaluator:
 
     def get_live_ciphertexts(self):
         return self.backend.GetLiveCiphertexts()
-

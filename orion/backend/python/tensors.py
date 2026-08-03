@@ -1,5 +1,10 @@
 import sys
 import math
+from pathlib import Path
+
+import h5py
+import numpy as np
+import torch
 
 class PlainTensor:
     def __init__(self, scheme, ptxt_ids, shape, on_shape=None):
@@ -365,7 +370,11 @@ class CipherTensor:
             # SerializeCiphertext returns (numpy_array, pointer_to_free)
             # We only need the numpy array
             if isinstance(result, tuple):
-                data = result[0]
+                data, pointer = result
+                try:
+                    data = data.copy()
+                finally:
+                    self.backend.FreeCArray(pointer)
             else:
                 data = result
             serialized_data.append(data)
@@ -375,10 +384,47 @@ class CipherTensor:
             'on_shape': self.on_shape
         }
 
+    def save(self, path):
+        """Write a CipherTensor to a versioned, non-executable HDF5 file."""
+        path = Path(path)
+        temporary = path.with_suffix(path.suffix + ".tmp")
+        serialized = self.serialize()
+        with h5py.File(temporary, "w") as output:
+            output.attrs["format"] = "orion-cipher-tensor"
+            output.attrs["version"] = 1
+            output.create_dataset(
+                "shape", data=np.asarray(tuple(serialized["shape"]), dtype=np.int64)
+            )
+            output.create_dataset(
+                "on_shape",
+                data=np.asarray(tuple(serialized["on_shape"]), dtype=np.int64),
+            )
+            ciphertexts = output.create_group("ciphertexts", track_order=True)
+            for index, data in enumerate(serialized["data"]):
+                ciphertexts.create_dataset(str(index), data=data)
+        temporary.replace(path)
+
+    @classmethod
+    def load(cls, scheme, path):
+        """Load a CipherTensor written by :meth:`save`."""
+        with h5py.File(path, "r") as source:
+            if (source.attrs.get("format") != "orion-cipher-tensor" or
+                    source.attrs.get("version") != 1):
+                raise ValueError("Unsupported Orion ciphertext file")
+            group = source["ciphertexts"]
+            names = sorted(group, key=int)
+            if names != [str(i) for i in range(len(names))]:
+                raise ValueError("Ciphertext datasets must be contiguous from zero")
+            serialized = {
+                "data": [group[name][()] for name in names],
+                "shape": torch.Size(source["shape"][()].tolist()),
+                "on_shape": torch.Size(source["on_shape"][()].tolist()),
+            }
+        return cls.deserialize(scheme, serialized)
+
     @classmethod
     def deserialize(cls, scheme, serialized):
         """Deserialize bytes back to CipherTensor."""
-        import numpy as np
         ctxt_ids = []
         for data in serialized['data']:
             # Ensure data is numpy array with uint8 dtype

@@ -14,12 +14,11 @@ var savedRotKeys = []uint64{}
 func NewEvaluator() {
 	scheme.Evaluator = ckks.NewEvaluator(
 		*scheme.Params, rlwe.NewMemEvaluationKeySet(scheme.RelinKey))
+}
 
-	// After declaring the evaluator, we'll also just generate and
-	// store in memory all power of two rotation keys. This will ensure
-	// all keys needed for the rotations and summations in the hyrid
-	// method remain alive.
-	AddPo2RotationKeys()
+//export GetRotationGaloisElement
+func GetRotationGaloisElement(rotation C.int) C.ulong {
+	return C.ulong(scheme.Params.GaloisElement(int(rotation)))
 }
 
 func AddPo2RotationKeys() {
@@ -461,4 +460,3 @@ func DeleteRotationKeys() {
 	liveRotKeys = make(map[uint64]*rlwe.GaloisKey)
 	savedRotKeys = []uint64{}
 }
-
